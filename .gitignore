@@ -1,0 +1,4 @@
+perl5/
+local/
+*.bak
+.env

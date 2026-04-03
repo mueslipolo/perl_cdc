@@ -1,0 +1,31 @@
+services:
+  oracle:
+    image: ghcr.io/gvenzl/oracle-free:slim-faststart
+    container_name: cdc-oracle
+    environment:
+      ORACLE_PASSWORD: secret
+      APP_USER: appuser
+      APP_USER_PASSWORD: apppass
+    ports:
+      - "1521:1521"
+    volumes:
+      - ./docker/init:/container-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh 2>/dev/null || sqlplus -s appuser/apppass@//localhost/FREEPDB1 <<< 'SELECT 1 FROM dual;' | grep -q 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    container_name: cdc-app
+    environment:
+      ORACLE_DSN: "dbi:Oracle:host=oracle;port=1521;service_name=FREEPDB1"
+      ORACLE_USER: appuser
+      ORACLE_PASS: apppass
+    depends_on:
+      oracle:
+        condition: service_healthy
