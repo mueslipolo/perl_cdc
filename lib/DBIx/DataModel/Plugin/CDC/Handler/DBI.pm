@@ -2,23 +2,35 @@ package DBIx::DataModel::Plugin::CDC::Handler::DBI;
 
 use strict;
 use warnings;
+use parent 'DBIx::DataModel::Plugin::CDC::Handler';
+
 use Carp qw(croak);
 use Scalar::Util qw(refaddr);
+use Params::Validate qw(validate_with SCALAR);
 use Cpanel::JSON::XS ();
+use namespace::clean;
+
+our $VERSION = '1.01';
 
 my $JSON = Cpanel::JSON::XS->new->utf8->canonical->allow_nonref;
 
+my $new_spec = {
+    table_name => { type => SCALAR, default => 'cdc_events',
+                    regex => qr/\A[a-zA-Z_]\w*\z/ },
+};
+
 sub new {
-    my ($class, %args) = @_;
-    my $table = $args{table_name} // 'cdc_events';
-    croak "Invalid table name: $table" unless $table =~ /\A[a-zA-Z_]\w*\z/;
+    my $class = shift;
+    my %args = validate_with(params => \@_, spec => $new_spec);
     return bless {
-        table_name  => $table,
-        _sth_cache  => {},   # refaddr => { sth => $sth, gen => $gen }
+        table_name  => $args{table_name},
+        _sth_cache  => {},
     }, $class;
 }
 
 sub phase { 'in_transaction' }
+
+sub table_name { $_[0]->{table_name} }
 
 sub dispatch_event {
     my ($self, $event, $schema) = @_;
@@ -39,8 +51,6 @@ sub dispatch_event {
     );
 }
 
-# Prepare once per $dbh, invalidate if the handle changes.
-# Uses refaddr + DBI generation counter to detect recycled handles.
 sub _get_sth {
     my ($self, $dbh) = @_;
     my $addr = refaddr($dbh);

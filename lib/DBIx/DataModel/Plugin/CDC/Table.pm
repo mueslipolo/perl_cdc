@@ -8,6 +8,9 @@ use Scalar::Util qw(blessed);
 use Try::Tiny;
 use DBIx::DataModel::Plugin::CDC;
 use DBIx::DataModel::Plugin::CDC::Event;
+use namespace::clean;
+
+our $VERSION = '1.01';
 
 # ---------------------------------------------------------------
 # _cdc_table_name() -> $name | undef

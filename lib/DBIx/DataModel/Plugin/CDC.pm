@@ -4,6 +4,7 @@ use strict;
 use warnings;
 use Carp qw(croak);
 use Cpanel::JSON::XS ();
+use namespace::clean;
 
 our $VERSION = '1.01';
 

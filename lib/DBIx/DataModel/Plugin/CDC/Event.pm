@@ -4,6 +4,9 @@ use strict;
 use warnings;
 use Carp qw(croak);
 use Time::HiRes ();
+use namespace::clean;
+
+our $VERSION = '1.01';
 
 my $_pid_hex = sprintf '%04x', $$ & 0xFFFF;
 my $_counter = 0;
@@ -45,15 +48,12 @@ sub build {
     };
 }
 
-# Time-based ID: seconds + microseconds + pid + counter.
-# Monotonically increasing within a process, unique across forks.
 sub _generate_id {
     my ($sec, $usec) = @_;
     $_counter = ($_counter + 1) & 0xFFFF;
     return sprintf '%08x-%04x-%s-%04x', $sec, $usec >> 4, $_pid_hex, $_counter;
 }
 
-# Cached strftime — avoid POSIX::strftime + gmtime overhead per call.
 {
     my $_last_sec = 0;
     my $_last_ts  = '';

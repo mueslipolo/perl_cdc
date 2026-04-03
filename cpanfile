@@ -6,3 +6,5 @@ requires 'Test::Exception';
 requires 'Try::Tiny';
 requires 'Scalar::Util';
 requires 'Cpanel::JSON::XS';
+requires 'Params::Validate';
+requires 'namespace::clean';
