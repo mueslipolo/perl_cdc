@@ -6,4 +6,4 @@ requires 'Test::Exception';
 requires 'Try::Tiny';
 requires 'Scalar::Util';
 requires 'POSIX';
-requires 'Class::Method::Modifiers';
+requires 'Cpanel::JSON::XS';
