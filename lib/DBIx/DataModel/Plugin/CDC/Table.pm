@@ -74,8 +74,23 @@ sub _cdc_ensure_atomic {
         return $code->();
     }
 
-    # AutoCommit on, not in do_transaction — wrap for atomicity.
-    return $self->schema->do_transaction($code);
+    # AutoCommit on — lightweight mini-transaction instead of the full
+    # do_transaction machinery (avoids wantarray handling, retry logic,
+    # after_commit_callbacks iteration on every single DML).
+    local $dbh->{AutoCommit} = 0;
+    local $dbh->{RaiseError} = 1;
+    my @result;
+    my $wantarray = wantarray;
+    eval {
+        @result = $wantarray ? $code->() : (scalar $code->());
+        $dbh->commit;
+        1;
+    } or do {
+        my $err = $@ || 'unknown error';
+        eval { $dbh->rollback };
+        die $err;
+    };
+    return $wantarray ? @result : $result[0];
 }
 
 # ---------------------------------------------------------------

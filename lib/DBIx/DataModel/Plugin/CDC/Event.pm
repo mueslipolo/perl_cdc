@@ -2,19 +2,12 @@ package DBIx::DataModel::Plugin::CDC::Event;
 
 use strict;
 use warnings;
-use POSIX qw(strftime);
+use Time::HiRes ();
 
-# ---------------------------------------------------------------
-# build(%args) -> \%event
-#
-# Constructs a canonical CDC event envelope.
-#
-#   table_name  => 'EMPLOYEES'
-#   operation   => 'INSERT' | 'UPDATE' | 'DELETE'
-#   schema_name => 'App::Schema'
-#   old_data    => \%hash | undef
-#   new_data    => \%hash | undef
-# ---------------------------------------------------------------
+# Pre-compute PID fragment for ID uniqueness across forks
+my $_pid_hex = sprintf '%04x', $$ & 0xFFFF;
+my $_counter = 0;
+
 sub build {
     my ($class, %args) = @_;
 
@@ -33,9 +26,11 @@ sub build {
         ];
     }
 
+    my ($sec, $usec) = Time::HiRes::gettimeofday();
+
     return {
-        event_id        => _generate_id(),
-        occurred_at     => strftime('%Y-%m-%dT%H:%M:%SZ', gmtime),
+        event_id        => _generate_id($sec, $usec),
+        occurred_at     => _format_ts($sec),
         schema_name     => $args{schema_name},
         table_name      => $args{table_name},
         operation       => $args{operation},
@@ -45,10 +40,29 @@ sub build {
     };
 }
 
-# Simple random hex ID — no external UUID dependency.
+# Time-based ID: seconds + microseconds + pid + counter.
+# Monotonically increasing within a process, unique across forks.
 sub _generate_id {
-    my @r = map { int(rand(65536)) } 1 .. 8;
-    return sprintf '%04x%04x-%04x-%04x-%04x-%04x%04x%04x', @r;
+    my ($sec, $usec) = @_;
+    $_counter = ($_counter + 1) & 0xFFFF;
+    return sprintf '%08x-%04x-%s-%04x', $sec, $usec >> 4, $_pid_hex, $_counter;
+}
+
+# Cached strftime — avoid POSIX::strftime + gmtime overhead per call.
+{
+    my $_last_sec = 0;
+    my $_last_ts  = '';
+
+    sub _format_ts {
+        my ($sec) = @_;
+        if ($sec != $_last_sec) {
+            my @t = gmtime($sec);
+            $_last_ts = sprintf '%04d-%02d-%02dT%02d:%02d:%02dZ',
+                $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0];
+            $_last_sec = $sec;
+        }
+        return $_last_ts;
+    }
 }
 
 1;

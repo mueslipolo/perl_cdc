@@ -263,12 +263,18 @@ Benchmark comparing **DBIx::DataModel without CDC** vs **with CDC enabled**
 | DELETE | ~545 ops/s | ~257 ops/s | +112% |
 | Batch INSERT (txn) | ~1029 ops/s | ~460 ops/s | +124% |
 
-The overhead is the extra `INSERT INTO cdc_events` (with JSON serialization)
-per DML operation.  DELETE overhead is higher due to the row snapshot before
-deletion.  Batching in a transaction amortizes commit overhead significantly.
+The overhead is dominated by the extra `INSERT INTO cdc_events` DB round-trip
+per DML.  Perl-side costs (JSON serialization, event envelope, snapshot) are
+negligible compared to the network + Oracle parse + redo log write.
 
-For high-throughput tables, consider the **transactional outbox** pattern:
-write to an outbox table in-transaction, relay to external systems asynchronously.
+Optimizations applied:
+- **Prepared statement cache** — DBI handler prepares `INSERT` once, reuses `$sth`
+- **Lightweight mini-transaction** — avoids `do_transaction` overhead in AutoCommit mode
+- **Cached timestamp** — `strftime` called at most once per second
+- **Time-based event IDs** — monotonic, no `rand()` calls
+
+For high-throughput tables, the **transactional outbox** pattern eliminates
+per-DML overhead: buffer events in an outbox table, relay asynchronously.
 
 Set `CDC_PERF_N` to adjust benchmark size:
 
