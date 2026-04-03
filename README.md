@@ -1,195 +1,77 @@
-# CDC PoC — Perl + DBIx::DataModel + Oracle Free
+# DBIx::DataModel::Plugin::CDC
 
-A **Change Data Capture (CDC)** proof-of-concept written in Perl, using
-[DBIx::DataModel](https://metacpan.org/pod/DBIx::DataModel) as the ORM and
-Oracle Free as the database, running in a container via
-[gvenzl/oci-oracle-free](https://github.com/gvenzl/oci-oracle-free) (Podman + podman-compose).
+**Application-level Change Data Capture** for [DBIx::DataModel](https://metacpan.org/pod/DBIx::DataModel).
+
+Captures INSERT, UPDATE, and DELETE events by extending the ORM's own
+`table_parent` inheritance mechanism — no database triggers, stored
+procedures, or DDL privileges required.  Pluggable handlers dispatch
+events to a database table, message queue, webhook, or custom callback.
 
 ---
 
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│  Docker Container  (gvenzl/oracle-free:slim-faststart)         │
-│                                                                │
-│  ┌──────────────────────┐    ┌───────────────────────────┐    │
-│  │  Oracle Free DB       │    │  CDC Audit Schema         │    │
-│  │  - DEPARTMENTS table  │◄──►│  - CDC_EVENTS table       │    │
-│  │  - EMPLOYEES table    │    │  - DML triggers (auto)    │    │
-│  └──────────────────────┘    └───────────────────────────┘    │
-│               ▲                                                │
-│               │ DBD::Oracle                                    │
-│  ┌────────────┴──────────────────────────────────────────┐    │
-│  │  Perl Application Layer                                │    │
-│  │  ┌─────────────────────┐  ┌────────────────────────┐  │    │
-│  │  │  App::Schema        │  │  CDC::Manager          │  │    │
-│  │  │  (DBIx::DataModel)  │  │  (query / parse CDC)   │  │    │
-│  │  └─────────────────────┘  └────────────────────────┘  │    │
-│  │  ┌─────────────────────┐                              │    │
-│  │  │  End-to-End Tests   │                              │    │
-│  │  │  (Test::More, 20 ✓) │                              │    │
-│  │  └─────────────────────┘                              │    │
-│  └───────────────────────────────────────────────────────┘    │
-└────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  DBIx::DataModel Schema                                         │
+│                                                                 │
+│  ┌─────────────────────────────────┐                            │
+│  │  Plugin::CDC::Table             │  table_parent override     │
+│  │  (extends Source::Table)        │  insert / update / delete  │
+│  └────────────┬────────────────────┘                            │
+│               │ dispatch                                        │
+│  ┌────────────▼──────────────────────────────────────────────┐  │
+│  │  Plugin::CDC  (registry + dispatcher)                     │  │
+│  │                                                           │  │
+│  │  in_transaction handlers ──► Handler::DBI (cdc_events)    │  │
+│  │                           ──► Handler::Callback (custom)  │  │
+│  │                                                           │  │
+│  │  post_commit handlers    ──► Handler::Callback (queue)    │  │
+│  │                           ──► Handler::Log (STDERR)       │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  Plugin::CDC::Event  ── builds canonical event envelope         │
+│  Plugin::CDC::Handler::Multi  ── fan-out with error policies    │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### CDC Strategy
+### How It Works
 
-Row-level **Oracle DML triggers** are generated automatically by the
-`create_cdc_trigger()` PL/SQL stored procedure and write before/after row
-images to the `CDC_EVENTS` audit table.
+1. **`CDC::Table`** is set as `table_parent` at schema declaration time.
+   Every table class inherits CDC-aware `insert`, `update`, and `delete`.
 
-Benefits:
+2. Before DML, the override snapshots the affected row(s).
+   After DML, it builds an **event envelope** and dispatches to handlers.
 
-- No Oracle LogMiner license required (works on Oracle Free).
-- Events are transactional — they roll back together with the source DML.
-- Transparent to application code — no ORM patches needed.
+3. **Transaction safety**: when `AutoCommit` is on, the DML + CDC write
+   are wrapped in `do_transaction` (DBIx::DataModel's own mechanism).
+   When `AutoCommit` is off, the caller's transaction governs both.
 
----
-
-## Directory Layout
-
-```
-cdc-poc/
-├── docker/
-│   └── init/
-│       ├── 01_schema.sql          # DEPARTMENTS + EMPLOYEES tables
-│       ├── 02_cdc_schema.sql      # CDC_EVENTS + create_cdc_trigger()
-│       └── 03_enable_cdc.sql      # Activates triggers on tracked tables
-├── lib/
-│   ├── App/Schema.pm              # DBIx::DataModel root schema
-│   ├── App/Schema/Department.pm   # Department table class
-│   ├── App/Schema/Employee.pm     # Employee table class
-│   └── CDC/Manager.pm             # CDC query / parse helper
-├── t/
-│   └── 01_cdc_end_to_end.t        # 20-subtest end-to-end suite
-├── cpanfile                       # Perl dependency manifest
-├── docker-compose.yml
-└── README.md
-```
-
----
-
-## Prerequisites
-
-| Requirement | Notes |
-|---|---|
-| Podman ≥ 4.9 | `sudo apt install podman` |
-| podman-compose | `sudo apt install podman-compose` |
-| Oracle Instant Client 23.6 (Basic + SDK ZIPs) | See step 1 below — required to compile `DBD::Oracle` |
-| Perl ≥ 5.20 | System Perl or perlbrew |
-| App::cpanminus | `sudo apt install cpanminus` or `cpan App::cpanminus` |
-| alien, libaio1t64, libaio-dev | Only needed if using RPMs instead of ZIPs |
+4. Handlers declare their **phase**:
+   - `in_transaction` — runs inside the DB transaction (atomic with DML)
+   - `post_commit` — runs after commit via `do_after_commit`
 
 ---
 
 ## Quick Start
 
-### 1 — Install Oracle Instant Client (Basic + SDK)
+### 1 — Prerequisites
 
-`DBD::Oracle` must be compiled against the Oracle client headers and libraries.
-The ZIP method works on any Linux distribution without root for the unzip step.
+| Requirement | Notes |
+|---|---|
+| Podman + podman-compose | `sudo apt install podman podman-compose` |
+| Nothing else | Oracle client, Perl, and all deps run in containers |
 
-Download the two ZIP files from Oracle's website — no account required:
-https://www.oracle.com/database/technologies/instant-client/linux-x86-64-downloads.html
-
-Click **Version 23.6**, then download:
-- **Basic Package** ZIP (`instantclient-basic-linux.x64-23.6.x.x.x.zip`)
-- **SDK Package** ZIP (`instantclient-sdk-linux.x64-23.6.x.x.x.zip`)
-
-Then install:
+### 2 — Run
 
 ```bash
-sudo mkdir -p /opt/oracle
-
-# Adjust filenames to match what you downloaded
-sudo unzip instantclient-basic-linux.x64-23.6.0.24.10.zip -d /opt/oracle
-sudo unzip instantclient-sdk-linux.x64-23.6.0.24.10.zip   -d /opt/oracle
-
-# Both ZIPs unzip into the same instantclient_23_6 directory
-export ORACLE_HOME=/opt/oracle/instantclient_23_6
-export LD_LIBRARY_PATH=$ORACLE_HOME:$LD_LIBRARY_PATH
-
-# Persist across shells
-echo 'export ORACLE_HOME=/opt/oracle/instantclient_23_6'       >> ~/.bashrc
-echo 'export LD_LIBRARY_PATH=$ORACLE_HOME:$LD_LIBRARY_PATH'    >> ~/.bashrc
+./setup.sh
 ```
 
-### 2 — Start Oracle
+This builds the app container (Perl + Oracle Instant Client), starts
+Oracle, waits for it, and runs the 43-test suite.
 
-```bash
-podman-compose up -d
-```
-
-Watch the logs until the init scripts finish and the database is ready
-(slim-faststart typically takes under 90 s):
-
-```bash
-podman logs -f cdc-oracle
-# Wait for: DATABASE IS READY TO USE!
-# Then Ctrl+C
-```
-
-Or poll the healthcheck:
-
-```bash
-until podman exec cdc-oracle healthcheck.sh 2>/dev/null; do
-    printf 'Waiting for Oracle…\n'; sleep 5
-done
-echo 'Oracle is ready.'
-```
-
-### 3 — Install Perl dependencies
-
-First, set up `local::lib` so `cpanm` can install modules without root:
-
-```bash
-cpanm --local-lib=~/perl5 local::lib && eval $(perl -I ~/perl5/lib/perl5/ -Mlocal::lib)
-
-# Persist across shells
-echo 'eval $(perl -I ~/perl5/lib/perl5/ -Mlocal::lib)' >> ~/.bashrc
-```
-
-Then install all dependencies:
-
-```bash
-cpanm --installdeps .
-```
-
-> `ORACLE_HOME` and `LD_LIBRARY_PATH` must be set (step 1) before running this,
-> otherwise `DBD::Oracle` will fail to compile.
-
-### 4 — Set connection environment (optional)
-
-The test script defaults to:
-
-```
-host=localhost  port=1521  service_name=FREEPDB1
-user=appuser    pass=apppass
-```
-
-Override with:
-
-```bash
-export ORACLE_DSN="dbi:Oracle:host=localhost;port=1521;service_name=FREEPDB1"
-export ORACLE_USER="appuser"
-export ORACLE_PASS="apppass"
-```
-
-### 5 — Run the tests
-
-```bash
-prove -lv t/01_cdc_end_to_end.t
-```
-
-Or directly:
-
-```bash
-perl -Ilib t/01_cdc_end_to_end.t
-```
-
-### 6 — Tear down
+### 3 — Tear down
 
 ```bash
 podman-compose down -v
@@ -197,95 +79,317 @@ podman-compose down -v
 
 ---
 
-## Troubleshooting
+## Usage
 
-**`short-name did not resolve to an alias`** — Podman requires fully-qualified image names.
-The `docker-compose.yml` already uses `ghcr.io/gvenzl/oracle-free:slim-faststart` to avoid
-this and Docker Hub rate limits.
+### Schema Declaration
 
-**`oci.h: No such file or directory`** during `cpanm DBD::Oracle` — the SDK ZIP was not
-unzipped, or `ORACLE_HOME` is not set. Verify with:
-```bash
-ls $ORACLE_HOME/sdk/include/oci.h
+```perl
+use DBIx::DataModel;
+use DBIx::DataModel::Plugin::CDC::Table;
+
+DBIx::DataModel->Schema('App::Schema',
+    table_parent => 'DBIx::DataModel::Plugin::CDC::Table',
+);
+
+App::Schema->Table(Department => 'departments', 'id');
+App::Schema->Table(Employee   => 'employees',   'id');
 ```
 
-**Volume mount warnings (`"/" is not a shared mount`)** — harmless on rootless Podman;
-the init SQL files are still mounted and executed correctly.
+### CDC Setup
 
-**SELinux / permission errors on the init volume** — append `:z` to the volume line in
-`docker-compose.yml`:
-```yaml
-volumes:
-  - ./docker/init:/container-entrypoint-initdb.d:z
+```perl
+use DBIx::DataModel::Plugin::CDC;
+use DBIx::DataModel::Plugin::CDC::Handler::DBI;
+use DBIx::DataModel::Plugin::CDC::Handler::Callback;
+
+App::Schema->dbh($dbh);
+
+DBIx::DataModel::Plugin::CDC->setup('App::Schema',
+    tables   => 'all',                    # or ['Department', 'Employee']
+    handlers => [
+        DBIx::DataModel::Plugin::CDC::Handler::DBI->new(
+            table_name => 'cdc_events',   # writes JSON to this table
+        ),
+        DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
+            phase    => 'post_commit',
+            on_event => sub {
+                my ($event) = @_;
+                # Send to Redis, RabbitMQ, Kafka, webhook...
+                $redis->xadd('cdc:events', '*',
+                    payload => encode_json($event));
+            },
+        ),
+    ],
+);
+```
+
+### Query Events
+
+```perl
+my $CDC = 'DBIx::DataModel::Plugin::CDC';
+
+my $events = $CDC->events_for('App::Schema',
+    table => 'employees', operation => 'UPDATE');
+
+my $last = $CDC->latest_event('App::Schema',
+    table => 'employees', operation => 'INSERT');
+
+my $n = $CDC->count_events('App::Schema', table => 'employees');
+
+my $pairs = $CDC->event_pairs('App::Schema', table => 'employees');
+# [ [\%old, \%new], ... ]
+
+$CDC->clear_events('App::Schema');
+$CDC->clear_events_for('App::Schema', table => 'employees');
+```
+
+---
+
+## Event Envelope
+
+Every handler receives a hashref with this structure:
+
+```perl
+{
+    event_id        => '4a3f...',              # unique hex ID
+    occurred_at     => '2026-04-03T14:32:01Z', # ISO 8601 UTC
+    schema_name     => 'App::Schema',
+    table_name      => 'EMPLOYEES',
+    operation       => 'UPDATE',               # INSERT | UPDATE | DELETE
+    old_data        => { ID => 42, SALARY => 75000, ... },  # undef for INSERT
+    new_data        => { ID => 42, SALARY => 80000, ... },  # undef for DELETE
+    changed_columns => ['SALARY'],             # UPDATE only, undef otherwise
+}
+```
+
+The DBI handler serializes `old_data`/`new_data` to JSON.
+Callback handlers receive raw Perl hashrefs.
+
+---
+
+## Handlers
+
+### Handler::DBI
+
+Writes events to a database table in the same transaction as the DML.
+
+```perl
+DBIx::DataModel::Plugin::CDC::Handler::DBI->new(
+    table_name => 'cdc_events',    # default
+);
+```
+
+- **Phase**: `in_transaction`
+- **Serialization**: JSON via `Cpanel::JSON::XS`
+- **Failure**: exception propagates → transaction rolls back
+
+### Handler::Callback
+
+Calls a user-provided coderef with the event envelope.
+
+```perl
+DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
+    on_event => sub { my ($event, $schema) = @_; ... },
+    phase    => 'post_commit',     # or 'in_transaction'
+    on_error => 'warn',            # or 'abort', 'ignore'
+);
+```
+
+### Handler::Log
+
+Structured log to STDERR.  Useful for debugging.
+
+```perl
+DBIx::DataModel::Plugin::CDC::Handler::Log->new(
+    prefix => 'CDC',               # default
+);
+```
+
+- **Phase**: `post_commit`
+- Output: `[CDC] EMPLOYEES UPDATE 4a3f...`
+
+### Handler::Multi
+
+Fan-out dispatcher with per-handler error policies.
+
+```perl
+DBIx::DataModel::Plugin::CDC::Handler::Multi->new(
+    handlers => [$dbi_handler, $callback_handler, $log_handler],
+    on_error => 'warn',            # default policy
+);
+```
+
+Each sub-handler can override the error policy via its `on_error` method.
+Policies: `abort` (roll back DML), `warn` (log and continue), `ignore`.
+
+---
+
+## Transaction Safety
+
+| Scenario | Behavior |
+|---|---|
+| `AutoCommit` ON | DML + CDC write wrapped in `do_transaction` — atomic |
+| `AutoCommit` OFF | Caller's transaction governs both — commit/rollback together |
+| `do_transaction` | Nested correctly — CDC hooks participate in the same txn |
+| Constraint violation | DML fails → CDC write never happens |
+| Handler failure (`abort`) | Exception propagates → transaction rolls back |
+| Handler failure (`warn`) | Warning emitted → DML commits normally |
+| `post_commit` handler | Runs after commit via `do_after_commit` — cannot rollback |
+
+---
+
+## Captured DML Paths
+
+| ORM Path | Captured | Notes |
+|---|---|---|
+| `Table->insert({...})` | Yes | One event per record hashref |
+| `$row->update({...})` | Yes | Snapshots old state from `$self` |
+| `$row->delete()` | Yes | Snapshots old state before delete |
+| `Table->update(-set => {}, -where => {})` | Yes | Pre-fetches affected rows, one event per row |
+| `Table->delete(-where => {})` | Yes | Pre-fetches affected rows |
+| `$dbh->do(...)` / raw SQL | **No** | By design — only ORM operations are captured |
+
+---
+
+## Performance
+
+Benchmark on Oracle Free in a container (100 operations, `CDC_PERF_N=100`):
+
+| Operation | Rate | Notes |
+|---|---|---|
+| Raw DBI INSERT (no CDC) | ~930 ops/s | Baseline |
+| CDC ORM INSERT | ~230 ops/s | DML + JSON serialize + CDC table write |
+| CDC ORM UPDATE | ~290 ops/s | Snapshot + DML + CDC write |
+| CDC ORM DELETE | ~230 ops/s | Snapshot + DML + CDC write |
+| Batch INSERT (txn) | ~370 ops/s | Single transaction, N inserts |
+
+The overhead is dominated by the extra `INSERT INTO cdc_events` per operation.
+For high-throughput tables, consider the **transactional outbox** pattern:
+write to an outbox table in-transaction, relay to external systems asynchronously.
+
+Set `CDC_PERF_N` to adjust benchmark size:
+
+```bash
+podman run --rm --network cdc-poc_default \
+  -e ORACLE_DSN="dbi:Oracle:host=oracle;port=1521;service_name=FREEPDB1" \
+  -e ORACLE_USER=appuser -e ORACLE_PASS=apppass \
+  -e CDC_PERF_N=500 \
+  cdc-poc-app
+```
+
+---
+
+## Directory Layout
+
+```
+cdc-poc/
+├── lib/
+│   ├── DBIx/DataModel/Plugin/
+│   │   ├── CDC.pm                    # Setup, config, dispatch, query helpers
+│   │   └── CDC/
+│   │       ├── Table.pm              # table_parent (insert/update/delete override)
+│   │       ├── Event.pm              # Event envelope builder
+│   │       └── Handler/
+│   │           ├── DBI.pm            # JSON → cdc_events table
+│   │           ├── Callback.pm       # User coderef
+│   │           ├── Log.pm            # STDERR structured log
+│   │           └── Multi.pm          # Fan-out with error policies
+│   └── App/
+│       ├── Schema.pm                 # DBIx::DataModel schema
+│       └── Schema/
+│           ├── Department.pm
+│           └── Employee.pm
+├── t/
+│   └── 01_cdc_end_to_end.t          # 43 tests + performance benchmarks
+├── docker/
+│   ├── Dockerfile.app                # Perl + Oracle Instant Client
+│   └── init/
+│       ├── 01_schema.sh              # departments + employees tables
+│       └── 02_cdc_schema.sh          # cdc_events table
+├── docker-compose.yml
+├── cpanfile
+├── setup.sh                          # One-command setup + test
+└── README.md
 ```
 
 ---
 
 ## Test Coverage
 
-| # | Subtest | What is verified |
-|---|---------|-----------------|
-| 1 | Infrastructure | DB connectivity, all tables and stored procedure present |
-| 2 | Trigger installation | Both DML triggers compiled and active |
-| 3 | INSERT (raw DBI) | Event captured, old_data NULL, new_data populated |
-| 4 | INSERT (ORM) | DBIx::DataModel path, FK and default columns |
-| 5 | UPDATE (raw DBI) | old/new image comparison, unchanged columns preserved |
-| 6 | UPDATE (ORM) | DBIx::DataModel update path, salary change |
-| 7 | DELETE | new_data NULL, old_data present, NAME correct |
-| 8 | ROLLBACK | Zero events after rolled-back transaction |
-| 9 | COMMIT | Multi-statement transaction: exactly N events |
-| 10 | NULL values | NULL sentinel round-trips to undef |
-| 11 | Bulk INSERT | One event per row in a loop |
-| 12 | Bulk UPDATE | One event per affected row |
-| 13 | MERGE – INSERT branch | Trigger fires on WHEN NOT MATCHED path |
-| 14 | MERGE – UPDATE branch | Trigger fires on WHEN MATCHED path only |
-| 15 | Constraint violation | Failed DML produces zero events |
-| 16 | Cross-table FK | Parent + child INSERTs tracked; FK value preserved |
-| 17 | Special characters | Accents, apostrophes, dashes round-trip correctly |
-| 18 | Event metadata | event_id, event_time, table_name (upper-case) |
-| 19 | event_pairs() | Helper returns paired old/new hashrefs for UPDATEs |
-| 20 | TRUNCATE | DDL statement does not fire row-level triggers |
+### CRUD (5 tests)
+| # | Test | Verifies |
+|---|------|----------|
+| 1 | Infrastructure | DB connectivity, tables exist |
+| 2 | INSERT Department | Event captured, old_data NULL, new_data JSON |
+| 3 | INSERT Employee | FK value preserved in event |
+| 4 | UPDATE instance | Old/new salary comparison |
+| 5 | DELETE instance | old_data present, new_data NULL |
 
----
+### Transactions (8 tests)
+| # | Test | Verifies |
+|---|------|----------|
+| 6 | ROLLBACK | Zero events and zero rows |
+| 7 | COMMIT multi-statement | Exact event count per operation |
+| 8 | AutoCommit atomicity | DML + CDC event count match |
+| 9 | Full lifecycle in txn | INSERT → UPDATE → DELETE |
+| 10 | Partial rollback | Error mid-txn rolls back everything |
+| 11 | Interleaved tables | Cross-table events in single txn |
+| 12 | Constraint violation | No event for failed DML |
+| 13 | Constraint in txn | Full rollback on duplicate |
 
-## Key Modules
+### Class-Method Operations (3 tests)
+| # | Test | Verifies |
+|---|------|----------|
+| 14 | Class-method UPDATE | Per-row old/new with full snapshot |
+| 15 | Class-method DELETE | Per-row old_data capture |
+| 16 | No matching rows | Zero events when WHERE matches nothing |
 
-### `CDC::Manager`
+### Data Integrity (8 tests)
+| # | Test | Verifies |
+|---|------|----------|
+| 17 | NULL columns | NULL preserved in JSON |
+| 18 | Unchanged columns | old/new identical for unmodified fields |
+| 19 | Bulk INSERT | One event per row |
+| 20 | Cross-table FK | FK value in child event |
+| 21 | Special characters | UTF-8 round-trip (accents, en-dash) |
+| 22 | Empty string vs NULL | Oracle '' → NULL behavior |
+| 23 | Multiple updates | Full history preserved |
+| 24 | JSON round-trip | Valid JSON, correct structure |
 
-```perl
-use CDC::Manager;
-my $cdc = CDC::Manager->new(dbh => $dbh);
+### Metadata & Helpers (5 tests)
+| # | Test | Verifies |
+|---|------|----------|
+| 25 | Event metadata | event_id, event_time, table_name |
+| 26 | Event ordering | Ascending event_id |
+| 27 | event_pairs() | Old/new hashref pairs for UPDATEs |
+| 28 | count_events filter | Per-operation filtering |
+| 29 | clear_events_for | Selective per-table cleanup |
 
-# Query events
-my $events = $cdc->events_for(table => 'employees');
-my $n      = $cdc->count_events(table => 'employees', operation => 'INSERT');
-my $last   = $cdc->latest_event(table => 'employees', operation => 'UPDATE');
+### Plugin Features (9 tests)
+| # | Test | Verifies |
+|---|------|----------|
+| 30 | Callback envelope | All fields present (event_id, occurred_at, schema_name) |
+| 31 | changed_columns | Only modified columns listed |
+| 32 | UPDATE old/new data | Hashrefs with correct values |
+| 33 | INSERT/DELETE nulls | old_data/new_data undef where expected |
+| 34 | Event::build IDs | Unique per call |
+| 35 | changed_columns logic | Only for UPDATE, correct diff |
+| 36 | Multi handler | Both DBI and Callback fire |
+| 37 | Error policy: warn | DML succeeds, warning emitted |
+| 38 | Error policy: abort | DML rolls back on handler failure |
 
-# Parse a row image
-my $row = $cdc->parse_row_image($last->{new_data});
-# { ID => '42', FIRST_NAME => 'Alice', SALARY => '90000', ACTIVE => '1', … }
+### Performance (4 tests)
+| # | Test | Verifies |
+|---|------|----------|
+| 39 | INSERT throughput | Raw DBI vs CDC ORM ops/s |
+| 40 | UPDATE throughput | Per-row update rate |
+| 41 | DELETE throughput | Per-row delete rate |
+| 42 | Batch INSERT in txn | Transaction batching benefit |
 
-# Maintenance
-$cdc->clear_events();                        # wipe all events
-$cdc->clear_events_for(table => 'employees');
-
-# Convenience: UPDATE pairs
-my $pairs = $cdc->event_pairs(table => 'employees');
-# [ [$old_href, $new_href], … ]
-```
-
-### `App::Schema`
-
-```perl
-use App::Schema;
-App::Schema->dbh($dbh);
-
-my $dept = App::Schema->table('Department')->insert({ name => 'Eng', location => 'GVA' });
-my $emp  = App::Schema->table('Employee')
-               ->select(-where => { email => 'alice@example.com' })
-               ->next;
-$emp->update({ salary => 95_000 });
-```
+### Design Trade-offs (1 test)
+| # | Test | Verifies |
+|---|------|----------|
+| 43 | Raw DBI bypass | Confirms raw SQL is not captured |
 
 ---
 
@@ -293,29 +397,35 @@ $emp->update({ salary => 95_000 });
 
 | Limitation | Notes |
 |---|---|
-| Serialisation format | Pipe-delimited `KEY=VALUE`; fragile if values contain `=` or `\|`. Use `JSON_OBJECT` in production. |
-| DDL changes | Triggers must be regenerated after `ALTER TABLE`. Re-run `create_cdc_trigger`. |
-| TRUNCATE | Oracle row-level triggers do not fire on `TRUNCATE`. Use DELETE for tracked tables. |
-| No SCN | System Change Number not captured; add `ORA_ROWSCN` for strict cross-table ordering. |
-| No LogMiner | DDL events not captured. LogMiner unavailable on Oracle Free. |
-| Trigger overhead | Row triggers add per-row latency. Profile before using on high-throughput tables. |
+| Raw SQL bypass | Only ORM operations are captured. Direct `$dbh->do()` is invisible. |
+| Pre-fetch overhead | Class-method `update`/`delete` fetch affected rows before DML. |
+| No LogMiner | DDL events not captured. |
+| Serialization | JSON via `Cpanel::JSON::XS`. Values containing non-UTF-8 binary may need custom handling. |
+| Single schema | Registry is per-schema-class. Multi-schema setups need separate `setup()` calls. |
 
 ---
 
 ## Future Extensions
 
-- **JSON row images** — replace pipe-delimited strings with `JSON_OBJECT()`.
-- **Hook-based CDC** — wrap `DBIx::DataModel` execution layer in Perl (portable, no DDL privileges needed).
-- **Outbox / streaming** — poll `CDC_EVENTS` and publish to Kafka, RabbitMQ, or HTTP webhook.
-- **SCN ordering** — correlate events to Oracle's global transaction order via `ORA_ROWSCN`.
-- **DDL capture** — use Oracle Fine-Grained Auditing (FGA) or a system trigger to capture schema changes.
+- **Transactional outbox** — write to outbox table in-txn, relay to Kafka/RabbitMQ/Redis asynchronously.
+- **Handler::Redis** — Redis Streams (`XADD`) for lightweight event streaming.
+- **Handler::AMQP** — RabbitMQ via `Net::AMQP::RabbitMQ` with publisher confirms.
+- **Per-table handler config** — different handlers for different tables.
+- **Schema-level filtering** — skip events for specific columns or operations.
+- **CPAN publication** — package as `DBIx-DataModel-Plugin-CDC` distribution.
 
 ---
 
 ## References
 
-- [gvenzl/oci-oracle-free](https://github.com/gvenzl/oci-oracle-free)
 - [DBIx::DataModel on CPAN](https://metacpan.org/pod/DBIx::DataModel)
 - [DBD::Oracle on CPAN](https://metacpan.org/pod/DBD::Oracle)
-- [Oracle PL/SQL Triggers](https://docs.oracle.com/en/database/oracle/oracle-database/23/lnpls/plsql-triggers.html)
-- [Oracle JSON_OBJECT](https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/JSON_OBJECT.html)
+- [Cpanel::JSON::XS on CPAN](https://metacpan.org/pod/Cpanel::JSON::XS)
+- [gvenzl/oci-oracle-free](https://github.com/gvenzl/oracle-free)
+- [Transactional Outbox Pattern](https://microservices.io/patterns/data/transactional-outbox.html)
+
+---
+
+## License
+
+Copyright Yves. Apache 2.0.
