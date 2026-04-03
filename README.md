@@ -253,17 +253,20 @@ Policies: `abort` (roll back DML), `warn` (log and continue), `ignore`.
 
 ## Performance
 
-Benchmark on Oracle Free in a container (100 operations, `CDC_PERF_N=100`):
+Benchmark comparing **DBIx::DataModel without CDC** vs **with CDC enabled**
+(Oracle Free in container, N=100, `CDC_PERF_N=100`):
 
-| Operation | Rate | Notes |
-|---|---|---|
-| Raw DBI INSERT (no CDC) | ~930 ops/s | Baseline |
-| CDC ORM INSERT | ~230 ops/s | DML + JSON serialize + CDC table write |
-| CDC ORM UPDATE | ~290 ops/s | Snapshot + DML + CDC write |
-| CDC ORM DELETE | ~230 ops/s | Snapshot + DML + CDC write |
-| Batch INSERT (txn) | ~370 ops/s | Single transaction, N inserts |
+| Operation | ORM only | ORM + CDC | CDC overhead |
+|---|---|---|---|
+| INSERT | ~395 ops/s | ~289 ops/s | +37% |
+| UPDATE | ~491 ops/s | ~309 ops/s | +59% |
+| DELETE | ~545 ops/s | ~257 ops/s | +112% |
+| Batch INSERT (txn) | ~1029 ops/s | ~460 ops/s | +124% |
 
-The overhead is dominated by the extra `INSERT INTO cdc_events` per operation.
+The overhead is the extra `INSERT INTO cdc_events` (with JSON serialization)
+per DML operation.  DELETE overhead is higher due to the row snapshot before
+deletion.  Batching in a transaction amortizes commit overhead significantly.
+
 For high-throughput tables, consider the **transactional outbox** pattern:
 write to an outbox table in-transaction, relay to external systems asynchronously.
 

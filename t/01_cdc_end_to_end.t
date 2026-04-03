@@ -754,27 +754,45 @@ subtest 'Handler error policy: abort – DML rolls back' => sub {
 
 # ===============================================================
 # 8. PERFORMANCE BENCHMARKS
+#
+# Compares DBIx::DataModel with vs without CDC enabled.
+# CDC is disabled by temporarily clearing the tracked-table registry.
+# Set CDC_PERF_N env var to adjust (default: 100).
 # ===============================================================
 
-subtest 'Performance – INSERT throughput' => sub {
-    plan tests => 3;
-    clean_tables();
+# Helper: temporarily disable CDC for benchmarking
+sub _with_cdc_disabled {
+    my ($code) = @_;
+    my $cfg = $CDC->config_for('App::Schema');
+    my $saved = $cfg->{tracked};
+    $cfg->{tracked} = {};   # nothing tracked → CDC hooks become pass-through
+    my @result = $code->();
+    $cfg->{tracked} = $saved;
+    return @result;
+}
+
+subtest 'Performance – INSERT: ORM vs ORM+CDC' => sub {
+    plan tests => 4;
     my $N = $ENV{CDC_PERF_N} || 100;
 
-    # Baseline: raw DBI inserts (no CDC)
+    # --- Baseline: ORM without CDC ---
+    clean_tables();
     my $t0 = [gettimeofday];
-    for my $i (1..$N) {
-        $dbh->do(q{INSERT INTO departments(name, location) VALUES(?, ?)},
-            undef, "raw_$i", 'bench');
-    }
-    my $raw_elapsed = tv_interval($t0);
-    my $raw_rate = $N / ($raw_elapsed || 0.001);
+    _with_cdc_disabled(sub {
+        for my $i (1..$N) {
+            App::Schema->table('Department')->insert({
+                name => "base_$i", location => 'bench',
+            });
+        }
+    });
+    my $base_elapsed = tv_interval($t0);
+    my $base_rate = $N / ($base_elapsed || 0.001);
 
-    # Cleanup
-    $dbh->do("DELETE FROM departments");
-    $CDC->clear_events('App::Schema');
+    is($CDC->count_events('App::Schema', table => 'departments'), 0,
+        'Baseline: zero CDC events (CDC disabled)');
 
-    # CDC: ORM inserts with CDC enabled
+    # --- ORM with CDC ---
+    clean_tables();
     $t0 = [gettimeofday];
     for my $i (1..$N) {
         App::Schema->table('Department')->insert({
@@ -784,108 +802,185 @@ subtest 'Performance – INSERT throughput' => sub {
     my $cdc_elapsed = tv_interval($t0);
     my $cdc_rate = $N / ($cdc_elapsed || 0.001);
 
-    my $overhead_pct = (($cdc_elapsed - $raw_elapsed) / ($raw_elapsed || 0.001)) * 100;
+    my $overhead_pct = $base_elapsed > 0
+        ? (($cdc_elapsed - $base_elapsed) / $base_elapsed) * 100
+        : 0;
 
-    # Report
     diag sprintf "INSERT benchmark (N=%d):", $N;
-    diag sprintf "  Raw DBI:  %.1f ops/s (%.3fs total)", $raw_rate, $raw_elapsed;
-    diag sprintf "  CDC ORM:  %.1f ops/s (%.3fs total)", $cdc_rate, $cdc_elapsed;
-    diag sprintf "  Overhead: %.1f%%", $overhead_pct;
+    diag sprintf "  ORM only:     %6.1f ops/s (%.3fs)", $base_rate, $base_elapsed;
+    diag sprintf "  ORM + CDC:    %6.1f ops/s (%.3fs)", $cdc_rate, $cdc_elapsed;
+    diag sprintf "  CDC overhead: %+.1f%%", $overhead_pct;
 
-    ok($raw_rate > 0, "Raw DBI rate: ${\sprintf '%.0f', $raw_rate} ops/s");
-    ok($cdc_rate > 0, "CDC ORM rate: ${\sprintf '%.0f', $cdc_rate} ops/s");
-
+    ok($base_rate > 0, sprintf "ORM baseline: %.0f ops/s", $base_rate);
+    ok($cdc_rate > 0,  sprintf "ORM + CDC:    %.0f ops/s", $cdc_rate);
     is($CDC->count_events('App::Schema',
         table => 'departments', operation => 'INSERT'), $N,
         "All $N CDC events captured");
 };
 
-subtest 'Performance – UPDATE throughput' => sub {
-    plan tests => 2;
-    clean_tables();
+subtest 'Performance – UPDATE: ORM vs ORM+CDC' => sub {
+    plan tests => 4;
     my $N = $ENV{CDC_PERF_N} || 100;
 
-    # Setup: insert N rows
-    for my $i (1..$N) {
-        App::Schema->table('Department')->insert({
-            name => "upd_$i", location => 'before',
-        });
-    }
-    $CDC->clear_events('App::Schema');
+    # Setup rows (with CDC, but we'll clear events)
+    clean_tables();
+    _with_cdc_disabled(sub {
+        for my $i (1..$N) {
+            App::Schema->table('Department')->insert({
+                name => "upd_$i", location => 'before',
+            });
+        }
+    });
 
-    # Fetch all rows, then update each
+    # --- Baseline: ORM UPDATE without CDC ---
     my $rows = App::Schema->table('Department')
         ->select(-where => { location => 'before' });
-
     my $t0 = [gettimeofday];
+    _with_cdc_disabled(sub {
+        for my $row (@$rows) {
+            $row->update({ location => 'mid' });
+        }
+    });
+    my $base_elapsed = tv_interval($t0);
+    my $base_rate = $N / ($base_elapsed || 0.001);
+
+    is($CDC->count_events('App::Schema', table => 'departments', operation => 'UPDATE'),
+        0, 'Baseline: zero UPDATE events');
+
+    # --- ORM UPDATE with CDC ---
+    $rows = App::Schema->table('Department')
+        ->select(-where => { location => 'mid' });
+    $t0 = [gettimeofday];
     for my $row (@$rows) {
         $row->update({ location => 'after' });
     }
-    my $elapsed = tv_interval($t0);
-    my $rate = $N / ($elapsed || 0.001);
+    my $cdc_elapsed = tv_interval($t0);
+    my $cdc_rate = $N / ($cdc_elapsed || 0.001);
 
-    diag sprintf "UPDATE benchmark (N=%d): %.1f ops/s (%.3fs)", $N, $rate, $elapsed;
+    my $overhead_pct = $base_elapsed > 0
+        ? (($cdc_elapsed - $base_elapsed) / $base_elapsed) * 100
+        : 0;
 
-    ok($rate > 0, "UPDATE rate: ${\sprintf '%.0f', $rate} ops/s");
+    diag sprintf "UPDATE benchmark (N=%d):", $N;
+    diag sprintf "  ORM only:     %6.1f ops/s (%.3fs)", $base_rate, $base_elapsed;
+    diag sprintf "  ORM + CDC:    %6.1f ops/s (%.3fs)", $cdc_rate, $cdc_elapsed;
+    diag sprintf "  CDC overhead: %+.1f%%", $overhead_pct;
+
+    ok($base_rate > 0, sprintf "ORM baseline: %.0f ops/s", $base_rate);
+    ok($cdc_rate > 0,  sprintf "ORM + CDC:    %.0f ops/s", $cdc_rate);
     is($CDC->count_events('App::Schema',
         table => 'departments', operation => 'UPDATE'), $N,
         "All $N UPDATE events captured");
 };
 
-subtest 'Performance – DELETE throughput' => sub {
-    plan tests => 2;
-    clean_tables();
+subtest 'Performance – DELETE: ORM vs ORM+CDC' => sub {
+    plan tests => 4;
     my $N = $ENV{CDC_PERF_N} || 100;
 
-    for my $i (1..$N) {
-        App::Schema->table('Department')->insert({
-            name => "del_$i", location => 'gone',
-        });
-    }
-    $CDC->clear_events('App::Schema');
-
+    # --- Baseline: ORM DELETE without CDC ---
+    clean_tables();
+    _with_cdc_disabled(sub {
+        for my $i (1..$N) {
+            App::Schema->table('Department')->insert({
+                name => "dbase_$i", location => 'gone',
+            });
+        }
+    });
     my $rows = App::Schema->table('Department')
         ->select(-where => { location => 'gone' });
-
     my $t0 = [gettimeofday];
-    for my $row (@$rows) {
-        $row->delete();
-    }
-    my $elapsed = tv_interval($t0);
-    my $rate = $N / ($elapsed || 0.001);
+    _with_cdc_disabled(sub {
+        for my $row (@$rows) { $row->delete() }
+    });
+    my $base_elapsed = tv_interval($t0);
+    my $base_rate = $N / ($base_elapsed || 0.001);
 
-    diag sprintf "DELETE benchmark (N=%d): %.1f ops/s (%.3fs)", $N, $rate, $elapsed;
+    is($CDC->count_events('App::Schema', table => 'departments', operation => 'DELETE'),
+        0, 'Baseline: zero DELETE events');
 
-    ok($rate > 0, "DELETE rate: ${\sprintf '%.0f', $rate} ops/s");
+    # --- ORM DELETE with CDC ---
+    clean_tables();
+    _with_cdc_disabled(sub {
+        for my $i (1..$N) {
+            App::Schema->table('Department')->insert({
+                name => "dcdc_$i", location => 'gone',
+            });
+        }
+    });
+    $rows = App::Schema->table('Department')
+        ->select(-where => { location => 'gone' });
+    $t0 = [gettimeofday];
+    for my $row (@$rows) { $row->delete() }
+    my $cdc_elapsed = tv_interval($t0);
+    my $cdc_rate = $N / ($cdc_elapsed || 0.001);
+
+    my $overhead_pct = $base_elapsed > 0
+        ? (($cdc_elapsed - $base_elapsed) / $base_elapsed) * 100
+        : 0;
+
+    diag sprintf "DELETE benchmark (N=%d):", $N;
+    diag sprintf "  ORM only:     %6.1f ops/s (%.3fs)", $base_rate, $base_elapsed;
+    diag sprintf "  ORM + CDC:    %6.1f ops/s (%.3fs)", $cdc_rate, $cdc_elapsed;
+    diag sprintf "  CDC overhead: %+.1f%%", $overhead_pct;
+
+    ok($base_rate > 0, sprintf "ORM baseline: %.0f ops/s", $base_rate);
+    ok($cdc_rate > 0,  sprintf "ORM + CDC:    %.0f ops/s", $cdc_rate);
     is($CDC->count_events('App::Schema',
         table => 'departments', operation => 'DELETE'), $N,
         "All $N DELETE events captured");
 };
 
 subtest 'Performance – batch INSERT in transaction' => sub {
-    plan tests => 2;
-    clean_tables();
+    plan tests => 4;
     my $N = $ENV{CDC_PERF_N} || 100;
 
+    # --- Baseline: batch ORM without CDC ---
+    clean_tables();
     my $t0 = [gettimeofday];
+    _with_cdc_disabled(sub {
+        local $dbh->{AutoCommit} = 0;
+        for my $i (1..$N) {
+            App::Schema->table('Department')->insert({
+                name => "bbase_$i", location => 'batch',
+            });
+        }
+        $dbh->commit();
+    });
+    my $base_elapsed = tv_interval($t0);
+    my $base_rate = $N / ($base_elapsed || 0.001);
+
+    is($CDC->count_events('App::Schema', table => 'departments'), 0,
+        'Baseline: zero events');
+
+    # --- Batch ORM with CDC ---
+    clean_tables();
+    $t0 = [gettimeofday];
     {
         local $dbh->{AutoCommit} = 0;
         for my $i (1..$N) {
             App::Schema->table('Department')->insert({
-                name => "txn_$i", location => 'batch',
+                name => "bcdc_$i", location => 'batch',
             });
         }
         $dbh->commit();
     }
-    my $elapsed = tv_interval($t0);
-    my $rate = $N / ($elapsed || 0.001);
+    my $cdc_elapsed = tv_interval($t0);
+    my $cdc_rate = $N / ($cdc_elapsed || 0.001);
 
-    diag sprintf "Batch INSERT in txn (N=%d): %.1f ops/s (%.3fs)", $N, $rate, $elapsed;
+    my $overhead_pct = $base_elapsed > 0
+        ? (($cdc_elapsed - $base_elapsed) / $base_elapsed) * 100
+        : 0;
 
-    ok($rate > 0, "Batch rate: ${\sprintf '%.0f', $rate} ops/s");
+    diag sprintf "Batch INSERT in txn (N=%d):", $N;
+    diag sprintf "  ORM only:     %6.1f ops/s (%.3fs)", $base_rate, $base_elapsed;
+    diag sprintf "  ORM + CDC:    %6.1f ops/s (%.3fs)", $cdc_rate, $cdc_elapsed;
+    diag sprintf "  CDC overhead: %+.1f%%", $overhead_pct;
+
+    ok($base_rate > 0, sprintf "ORM baseline: %.0f ops/s", $base_rate);
+    ok($cdc_rate > 0,  sprintf "ORM + CDC:    %.0f ops/s", $cdc_rate);
     is($CDC->count_events('App::Schema',
         table => 'departments', operation => 'INSERT'), $N,
-        "All $N events captured in batch");
+        "All $N events captured");
 };
 
 # ===============================================================
