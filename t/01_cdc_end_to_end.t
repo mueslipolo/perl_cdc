@@ -1011,7 +1011,138 @@ subtest 'Performance – batch INSERT in transaction' => sub {
 };
 
 # ===============================================================
-# 9. DESIGN TRADE-OFFS (DOCUMENTED)
+# 9. RELATIONSHIPS & MULTI-TABLE OPERATIONS
+# ===============================================================
+
+subtest 'FK insert – parent then child tracked separately' => sub {
+    plan tests => 4;
+    clean_tables();
+    App::Schema->table('Department')->insert({ name => 'Parent', location => 'A' });
+    my $dept_id = _parse($CDC->latest_event('App::Schema',
+        table => 'departments', operation => 'INSERT')->{new_data})->{ID};
+
+    App::Schema->table('Employee')->insert({
+        department_id => $dept_id, first_name => 'Child', last_name => 'Row',
+        email => 'child@example.com', salary => 50_000,
+    });
+
+    is($CDC->count_events('App::Schema', table => 'departments', operation => 'INSERT'),
+        1, 'One department INSERT event');
+    is($CDC->count_events('App::Schema', table => 'employees', operation => 'INSERT'),
+        1, 'One employee INSERT event');
+    my $emp_data = _parse($CDC->latest_event('App::Schema',
+        table => 'employees', operation => 'INSERT')->{new_data});
+    is($emp_data->{DEPARTMENT_ID}, $dept_id, 'FK value captured in child event');
+    is($emp_data->{FIRST_NAME}, 'Child', 'Child data captured');
+};
+
+subtest 'Delete parent after children – events for both tables' => sub {
+    plan tests => 3;
+    clean_tables();
+    my $dept_id = _insert_dept(name => 'DelParent', location => 'X');
+    App::Schema->table('Employee')->insert({
+        department_id => $dept_id, first_name => 'E', last_name => 'D',
+        email => 'ed@example.com', salary => 40_000,
+    });
+    $CDC->clear_events('App::Schema');
+
+    # Delete child first (FK constraint), then parent
+    my $emp = _fetch_emp({ email => 'ed@example.com' });
+    $emp->delete();
+    my $dept = _fetch_dept({ name => 'DelParent' });
+    $dept->delete();
+
+    is($CDC->count_events('App::Schema', table => 'employees', operation => 'DELETE'),
+        1, 'Employee DELETE event');
+    is($CDC->count_events('App::Schema', table => 'departments', operation => 'DELETE'),
+        1, 'Department DELETE event');
+    my ($n) = $dbh->selectrow_array('SELECT COUNT(*) FROM departments');
+    is($n, 0, 'Both tables empty');
+};
+
+subtest 'Cross-table transaction – rollback undoes all events' => sub {
+    plan tests => 3;
+    clean_tables();
+    my $caught = 0;
+    {
+        local $dbh->{AutoCommit} = 0;
+        try {
+            App::Schema->table('Department')->insert({
+                name => 'TxnDept', location => 'Z',
+            });
+            my $dept = _fetch_dept({ name => 'TxnDept' });
+            App::Schema->table('Employee')->insert({
+                department_id => $dept->{id}, first_name => 'T', last_name => 'X',
+                email => 'tx@example.com', salary => 50_000,
+            });
+            # Force failure
+            die "Simulated error";
+        } catch {
+            $caught = 1;
+            $dbh->rollback();
+        };
+    }
+    ok($caught, 'Error caught');
+    is($CDC->count_events('App::Schema', table => 'departments'), 0,
+        'Department events rolled back');
+    is($CDC->count_events('App::Schema', table => 'employees'), 0,
+        'Employee events rolled back');
+};
+
+subtest 'Snapshot excludes non-scalar fields (subtree refs)' => sub {
+    plan tests => 2;
+    clean_tables();
+    @callback_events = ();
+    App::Schema->table('Department')->insert({ name => 'SnapTest', location => 'Y' });
+
+    # The callback gets the raw event — verify no arrayref in new_data
+    my @ins = grep { $_->{operation} eq 'INSERT' } @callback_events;
+    my $new = $ins[-1]{new_data};
+    ok(defined $new->{NAME}, 'NAME present in snapshot');
+    my @refs = grep { ref $new->{$_} } keys %$new;
+    is(scalar @refs, 0, 'No reference values in snapshot (arrayrefs filtered)');
+};
+
+subtest 'Rapid successive operations on related tables' => sub {
+    plan tests => 3;
+    clean_tables();
+    {
+        local $dbh->{AutoCommit} = 0;
+        # Create department
+        App::Schema->table('Department')->insert({ name => 'Rapid', location => 'A' });
+        my $dept = _fetch_dept({ name => 'Rapid' });
+
+        # Create employee, update it, delete it — all in one transaction
+        App::Schema->table('Employee')->insert({
+            department_id => $dept->{id}, first_name => 'R', last_name => 'S',
+            email => 'rs@example.com', salary => 50_000,
+        });
+        my $emp = _fetch_emp({ email => 'rs@example.com' });
+        $emp->update({ salary => 60_000 });
+        $emp->delete();
+
+        # Update and delete the department too
+        $dept->update({ location => 'B' });
+        $dept->delete();
+
+        $dbh->commit();
+    }
+
+    # Should have: dept INSERT + UPDATE + DELETE, emp INSERT + UPDATE + DELETE
+    is($CDC->count_events('App::Schema', table => 'departments'), 3,
+        'Department: INSERT + UPDATE + DELETE = 3 events');
+    is($CDC->count_events('App::Schema', table => 'employees'), 3,
+        'Employee: INSERT + UPDATE + DELETE = 3 events');
+
+    # Verify ordering: all department events, then employee events or interleaved
+    my $all = $CDC->events_for('App::Schema', table => 'departments');
+    my @ops = map { $_->{operation} } @$all;
+    is_deeply(\@ops, ['INSERT', 'UPDATE', 'DELETE'],
+        'Department events in correct order');
+};
+
+# ===============================================================
+# 10. DESIGN TRADE-OFFS (DOCUMENTED)
 # ===============================================================
 
 subtest 'Raw DBI bypass – not captured (by design)' => sub {

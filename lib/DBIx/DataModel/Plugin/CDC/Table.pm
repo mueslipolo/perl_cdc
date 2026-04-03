@@ -31,7 +31,7 @@ sub _cdc_snapshot {
     my ($class_or_self, $obj) = @_;
     return {
         map  { uc($_) => $obj->{$_} }
-        grep { !/^__/ }
+        grep { !/^__/ && !ref($obj->{$_}) }
         keys %$obj
     };
 }
