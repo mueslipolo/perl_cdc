@@ -25,7 +25,7 @@ App::Schema::Department – DBIx::DataModel table class for DEPARTMENTS
 
 =head1 DESCRIPTION
 
-Corresponds to the C<departments> Oracle table.
+Corresponds to the C<departments> table.
 
 Columns: C<id>, C<name>, C<location>, C<created_at>.
 

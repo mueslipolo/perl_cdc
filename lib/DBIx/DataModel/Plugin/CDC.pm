@@ -3,20 +3,17 @@ package DBIx::DataModel::Plugin::CDC;
 use strict;
 use warnings;
 use Carp qw(croak);
+use Cpanel::JSON::XS ();
 
-our $VERSION = '1.00';
+our $VERSION = '1.01';
+
+my $JSON_DECODE = Cpanel::JSON::XS->new->canonical->allow_nonref;
 
 # Package-level registry: schema_class => \%config
 my %REGISTRY;
 
 # ---------------------------------------------------------------
 # setup($schema_class, %args)
-#
-#   tables   => 'all' | \@table_names
-#   handlers => \@handler_objects
-#
-# Registers CDC configuration for a schema.  Must be called
-# after Table() declarations and before DML operations.
 # ---------------------------------------------------------------
 sub setup {
     my ($class, $schema_class, %args) = @_;
@@ -24,12 +21,10 @@ sub setup {
     croak 'handlers arrayref required'
         unless ref $args{handlers} eq 'ARRAY' && @{$args{handlers}};
 
-    # Resolve table list
     my $tables_arg = $args{tables} // 'all';
     my %tracked;
 
     if ($tables_arg eq 'all') {
-        # Track all tables registered in the schema's metadm
         for my $meta ($schema_class->metadm->tables) {
             $tracked{ $meta->name } = 1;
         }
@@ -47,17 +42,11 @@ sub setup {
     return $class;
 }
 
-# ---------------------------------------------------------------
-# config_for($schema_class) -> \%config | undef
-# ---------------------------------------------------------------
 sub config_for {
     my ($class, $schema_class) = @_;
     return $REGISTRY{$schema_class};
 }
 
-# ---------------------------------------------------------------
-# is_tracked($schema_class, $table_name) -> bool
-# ---------------------------------------------------------------
 sub is_tracked {
     my ($class, $schema_class, $table_name) = @_;
     my $cfg = $REGISTRY{$schema_class} or return 0;
@@ -65,12 +54,27 @@ sub is_tracked {
 }
 
 # ---------------------------------------------------------------
-# dispatch($schema_class, $schema_obj, $event)
+# _find_dbi_handler(\%config) -> $handler | undef
 #
-# Dispatches an event to all registered handlers.
-# in_transaction handlers run immediately.
-# post_commit handlers are deferred via do_after_commit (if in a
-# transaction) or run immediately after sync handlers (AutoCommit).
+# Locates the DBI handler in the handler list, including inside
+# Multi wrappers.  Single lookup used by all query helpers.
+# ---------------------------------------------------------------
+sub _find_dbi_handler {
+    my ($class, $cfg) = @_;
+    for my $h (@{ $cfg->{handlers} }) {
+        return $h if $h->isa('DBIx::DataModel::Plugin::CDC::Handler::DBI');
+        if ($h->isa('DBIx::DataModel::Plugin::CDC::Handler::Multi')) {
+            for my $sub (@{ $h->{handlers} }) {
+                return $sub
+                    if $sub->isa('DBIx::DataModel::Plugin::CDC::Handler::DBI');
+            }
+        }
+    }
+    return undef;
+}
+
+# ---------------------------------------------------------------
+# dispatch($schema_class, $schema_obj, $event)
 # ---------------------------------------------------------------
 sub dispatch {
     my ($class, $schema_class, $schema_obj, $event) = @_;
@@ -79,7 +83,6 @@ sub dispatch {
     my (@sync, @async);
     for my $h (@{ $cfg->{handlers} }) {
         if ($h->isa('DBIx::DataModel::Plugin::CDC::Handler::Multi')) {
-            # Multi handler manages its own phase dispatch
             $h->dispatch_event($event, $schema_obj);
             if ($h->has_post_commit_handlers) {
                 push @async, sub { $h->dispatch_post_commit($event, $schema_obj) };
@@ -91,50 +94,40 @@ sub dispatch {
         }
     }
 
-    # Schedule post_commit handlers
     if (@async) {
         if ($schema_obj->{transaction_dbhs}) {
-            # Inside do_transaction — defer to after commit
             $schema_obj->do_after_commit(sub {
                 $_->() for @async;
             });
         } else {
-            # AutoCommit mode — transaction already committed, run now
             $_->() for @async;
         }
     }
 }
 
 # ---------------------------------------------------------------
-# Query helpers (convenience, delegates to DBI handler's table)
+# Query helpers
 # ---------------------------------------------------------------
+
+sub _validated_table_name {
+    my ($class, $handler) = @_;
+    my $tbl = $handler->{table_name};
+    croak "Invalid table name: $tbl" unless $tbl =~ /\A[a-zA-Z_]\w*\z/;
+    return $tbl;
+}
+
 sub events_for {
     my ($class, $schema_class, %args) = @_;
     croak 'events_for: "table" argument required' unless $args{table};
     my $cfg = $REGISTRY{$schema_class} or croak 'CDC not configured';
 
-    # Find the DBI handler to get its table name
-    my $dbi_handler;
-    for my $h (@{ $cfg->{handlers} }) {
-        if ($h->isa('DBIx::DataModel::Plugin::CDC::Handler::DBI')) {
-            $dbi_handler = $h;
-            last;
-        }
-        if ($h->isa('DBIx::DataModel::Plugin::CDC::Handler::Multi')) {
-            for my $sub (@{ $h->{handlers} }) {
-                if ($sub->isa('DBIx::DataModel::Plugin::CDC::Handler::DBI')) {
-                    $dbi_handler = $sub;
-                    last;
-                }
-            }
-        }
-    }
-    croak 'No DBI handler configured — cannot query events'
-        unless $dbi_handler;
+    my $dbi_handler = $class->_find_dbi_handler($cfg)
+        or croak 'No DBI handler configured — cannot query events';
 
     my $schema_obj = $schema_class->singleton;
-    my $dbh        = $schema_obj->dbh;
-    my $tbl        = $dbi_handler->{table_name};
+    my $dbh        = $schema_obj->dbh
+        or croak 'No active database connection';
+    my $tbl        = $class->_validated_table_name($dbi_handler);
     my $table      = uc $args{table};
     my $op         = defined $args{operation} ? uc $args{operation} : undef;
 
@@ -163,38 +156,21 @@ sub latest_event {
 sub clear_events {
     my ($class, $schema_class) = @_;
     my $cfg = $REGISTRY{$schema_class} or return;
-
-    for my $h (@{ $cfg->{handlers} }) {
-        if ($h->isa('DBIx::DataModel::Plugin::CDC::Handler::DBI')) {
-            $schema_class->singleton->dbh->do(
-                "DELETE FROM " . $h->{table_name});
-            return;
-        }
-        if ($h->isa('DBIx::DataModel::Plugin::CDC::Handler::Multi')) {
-            for my $sub (@{ $h->{handlers} }) {
-                if ($sub->isa('DBIx::DataModel::Plugin::CDC::Handler::DBI')) {
-                    $schema_class->singleton->dbh->do(
-                        "DELETE FROM " . $sub->{table_name});
-                    return;
-                }
-            }
-        }
-    }
+    my $h = $class->_find_dbi_handler($cfg) or return;
+    my $tbl = $class->_validated_table_name($h);
+    $schema_class->singleton->dbh->do("DELETE FROM $tbl");
 }
 
 sub clear_events_for {
     my ($class, $schema_class, %args) = @_;
     croak 'table required' unless $args{table};
     my $cfg = $REGISTRY{$schema_class} or return;
-
-    for my $h (@{ $cfg->{handlers} }) {
-        if ($h->isa('DBIx::DataModel::Plugin::CDC::Handler::DBI')) {
-            $schema_class->singleton->dbh->do(
-                "DELETE FROM " . $h->{table_name} . " WHERE table_name = ?",
-                undef, uc $args{table});
-            return;
-        }
-    }
+    my $h = $class->_find_dbi_handler($cfg) or return;
+    my $tbl = $class->_validated_table_name($h);
+    $schema_class->singleton->dbh->do(
+        "DELETE FROM $tbl WHERE table_name = ?",
+        undef, uc $args{table},
+    );
 }
 
 sub event_pairs {
@@ -205,13 +181,8 @@ sub event_pairs {
         map {
             my $old = $_->{old_data};
             my $new = $_->{new_data};
-            # Parse JSON if strings
-            if (defined $old && !ref $old) {
-                $old = Cpanel::JSON::XS->new->utf8->decode($old);
-            }
-            if (defined $new && !ref $new) {
-                $new = Cpanel::JSON::XS->new->utf8->decode($new);
-            }
+            $old = $JSON_DECODE->decode($old) if defined $old && !ref $old;
+            $new = $JSON_DECODE->decode($new) if defined $new && !ref $new;
             [$old // {}, $new // {}]
         } @$events
     ];
@@ -231,13 +202,11 @@ DBIx::DataModel::Plugin::CDC — Change Data Capture for DBIx::DataModel
     use DBIx::DataModel::Plugin::CDC::Handler::DBI;
     use DBIx::DataModel::Plugin::CDC::Handler::Callback;
 
-    # 1. Declare schema with CDC table parent
     DBIx::DataModel->Schema('App::Schema',
         table_parent => 'DBIx::DataModel::Plugin::CDC::Table',
     );
     App::Schema->Table(Department => 'departments', 'id');
 
-    # 2. Configure handlers
     DBIx::DataModel::Plugin::CDC->setup('App::Schema',
         tables   => 'all',
         handlers => [

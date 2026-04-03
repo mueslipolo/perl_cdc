@@ -32,7 +32,7 @@ App::Schema::Employee – DBIx::DataModel table class for EMPLOYEES
 
 =head1 DESCRIPTION
 
-Corresponds to the C<employees> Oracle table.
+Corresponds to the C<employees> table.
 
 Columns: C<id>, C<department_id>, C<first_name>, C<last_name>,
 C<email>, C<salary>, C<active>, C<created_at>, C<updated_at>.

@@ -15,7 +15,6 @@ sub new {
     }, $class;
 }
 
-# Multi dispatches in both phases — it delegates phase logic internally.
 sub phase { 'in_transaction' }
 
 sub dispatch_event_for_phase {
@@ -36,8 +35,11 @@ sub dispatch_event_for_phase {
                 die $err;
             } elsif ($error_policy eq 'warn') {
                 warn "CDC handler " . ref($h) . " failed: $err";
+            } else {
+                # 'ignore' — log at debug level but don't propagate
+                warn "CDC handler " . ref($h) . " failed (ignored): $err"
+                    if $ENV{CDC_DEBUG};
             }
-            # 'ignore' — silently swallow
         };
     }
 }
@@ -54,7 +56,7 @@ sub dispatch_post_commit {
 
 sub has_post_commit_handlers {
     my ($self) = @_;
-    return grep { $_->phase eq 'post_commit' } @{ $self->{handlers} };
+    return !! grep { $_->phase eq 'post_commit' } @{ $self->{handlers} };
 }
 
 1;

@@ -44,8 +44,10 @@ events to a database table, message queue, webhook, or custom callback.
    After DML, it builds an **event envelope** and dispatches to handlers.
 
 3. **Transaction safety**: when `AutoCommit` is on, the DML + CDC write
-   are wrapped in `do_transaction` (DBIx::DataModel's own mechanism).
-   When `AutoCommit` is off, the caller's transaction governs both.
+   are wrapped in a lightweight mini-transaction (`local $dbh->{AutoCommit} = 0`
+   + commit/rollback).  When `AutoCommit` is off, the caller's transaction
+   governs both.  Inside `do_transaction`, post-commit handlers are deferred
+   via `do_after_commit`.
 
 4. Handlers declare their **phase**:
    - `in_transaction` — runs inside the DB transaction (atomic with DML)
@@ -228,7 +230,7 @@ Policies: `abort` (roll back DML), `warn` (log and continue), `ignore`.
 
 | Scenario | Behavior |
 |---|---|
-| `AutoCommit` ON | DML + CDC write wrapped in `do_transaction` — atomic |
+| `AutoCommit` ON | DML + CDC write wrapped in mini-transaction — atomic |
 | `AutoCommit` OFF | Caller's transaction governs both — commit/rollback together |
 | `do_transaction` | Nested correctly — CDC hooks participate in the same txn |
 | Constraint violation | DML fails → CDC write never happens |

@@ -5,5 +5,4 @@ requires 'Test::More',       '>= 1.302';
 requires 'Test::Exception';
 requires 'Try::Tiny';
 requires 'Scalar::Util';
-requires 'POSIX';
 requires 'Cpanel::JSON::XS';

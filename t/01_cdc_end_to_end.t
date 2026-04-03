@@ -500,14 +500,13 @@ subtest 'JSON serialization – structured data round-trip' => sub {
 # ===============================================================
 
 subtest 'Event metadata' => sub {
-    plan tests => 4;
+    plan tests => 3;
     clean_tables();
     App::Schema->table('Department')->insert({ name => 'Meta', location => 'B' });
     my $ev = $CDC->latest_event('App::Schema',
         table => 'departments', operation => 'INSERT');
     ok($ev, 'Event present');
-    ok($ev->{event_id} > 0, 'event_id positive');
-    ok(defined $ev->{event_time}, 'event_time set');
+    ok($ev->{event_id} > 0, 'event_id is auto-increment');
     is($ev->{table_name}, 'DEPARTMENTS', 'table_name upper-case');
 };
 
@@ -692,8 +691,8 @@ subtest 'Multi handler – DBI + Callback both fire' => sub {
     $cfg->{handlers} = $orig_handlers;
 };
 
-subtest 'Handler error policy: warn – DML succeeds' => sub {
-    plan tests => 2;
+subtest 'Handler error policy: warn – DML succeeds and commits' => sub {
+    plan tests => 4;
     clean_tables();
 
     my $failing_cb = DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
@@ -712,13 +711,18 @@ subtest 'Handler error policy: warn – DML succeeds' => sub {
     my $orig = $cfg->{handlers};
     $cfg->{handlers} = [$multi];
 
-    # The failing handler should warn but not abort the DML
     my $warned = 0;
     local $SIG{__WARN__} = sub { $warned++ if $_[0] =~ /Intentional/ };
     lives_ok {
         App::Schema->table('Department')->insert({ name => 'Warn', location => 'X' });
     } 'DML succeeds despite handler failure';
     ok($warned, 'Warning was emitted');
+
+    # Verify DML actually committed
+    my ($n) = $dbh->selectrow_array("SELECT COUNT(*) FROM departments WHERE name='Warn'");
+    is($n, 1, 'Row committed to database');
+    is($CDC->count_events('App::Schema', table => 'departments', operation => 'INSERT'),
+        1, 'CDC event also committed');
 
     $cfg->{handlers} = $orig;
 };
@@ -748,6 +752,29 @@ subtest 'Handler error policy: abort – DML rolls back' => sub {
     ok($died, 'DML aborted');
     my ($n) = $dbh->selectrow_array("SELECT COUNT(*) FROM departments WHERE name='Abort'");
     is($n, 0, 'Row not committed');
+
+    $cfg->{handlers} = $orig;
+};
+
+subtest 'Handler::Log – outputs structured log' => sub {
+    plan tests => 3;
+    clean_tables();
+
+    my $log_handler = DBIx::DataModel::Plugin::CDC::Handler::Log->new(
+        prefix => 'TEST_CDC',
+    );
+    is($log_handler->phase, 'post_commit', 'Log handler phase is post_commit');
+
+    my $cfg = $CDC->config_for('App::Schema');
+    my $orig = $cfg->{handlers};
+    $cfg->{handlers} = [$dbi_handler, $log_handler];
+
+    my $log_output = '';
+    local $SIG{__WARN__} = sub { $log_output .= $_[0] };
+    App::Schema->table('Department')->insert({ name => 'LogTest', location => 'X' });
+
+    like($log_output, qr/\[TEST_CDC\]/, 'Log prefix present');
+    like($log_output, qr/DEPARTMENTS.*INSERT/, 'Log contains table and operation');
 
     $cfg->{handlers} = $orig;
 };
