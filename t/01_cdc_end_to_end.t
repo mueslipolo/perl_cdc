@@ -2,9 +2,8 @@
 # =============================================================
 # t/01_cdc_end_to_end.t
 #
-# End-to-end tests for ORM-hook-based CDC.
-# CDC events are captured by wrapping DBIx::DataModel methods
-# in Perl — no database triggers or stored procedures needed.
+# Comprehensive end-to-end tests for ORM-hook-based CDC.
+# Covers: CRUD, transactions, atomicity, edge cases.
 #
 # Prerequisites:
 #   - Oracle Free container running and healthy
@@ -72,9 +71,22 @@ sub _insert_dept {
     return $cdc->parse_row_image($ev->{new_data})->{ID};
 }
 
-# ---------------------------------------------------------------
-# 1.  INFRASTRUCTURE
-# ---------------------------------------------------------------
+sub _fetch_dept {
+    my ($where) = @_;
+    my ($row) = @{ App::Schema->table('Department')->select(-where => $where) };
+    return $row;
+}
+
+sub _fetch_emp {
+    my ($where) = @_;
+    my ($row) = @{ App::Schema->table('Employee')->select(-where => $where) };
+    return $row;
+}
+
+# ===============================================================
+# SECTION 1: INFRASTRUCTURE
+# ===============================================================
+
 subtest 'Infrastructure – connectivity and table existence' => sub {
     plan tests => 4;
 
@@ -89,9 +101,10 @@ subtest 'Infrastructure – connectivity and table existence' => sub {
     }
 };
 
-# ---------------------------------------------------------------
-# 2.  INSERT via ORM
-# ---------------------------------------------------------------
+# ===============================================================
+# SECTION 2: BASIC CRUD CAPTURE
+# ===============================================================
+
 subtest 'INSERT capture – Department via ORM' => sub {
     plan tests => 6;
     clean_tables();
@@ -113,10 +126,7 @@ subtest 'INSERT capture – Department via ORM' => sub {
     is($new->{LOCATION}, 'Geneva',      'new_data LOCATION correct');
 };
 
-# ---------------------------------------------------------------
-# 3.  INSERT – Employee via ORM with FK
-# ---------------------------------------------------------------
-subtest 'INSERT capture – Employee via ORM' => sub {
+subtest 'INSERT capture – Employee via ORM with FK' => sub {
     plan tests => 4;
     clean_tables();
 
@@ -140,9 +150,6 @@ subtest 'INSERT capture – Employee via ORM' => sub {
     is($new->{DEPARTMENT_ID}, $dept_id,            'FK captured');
 };
 
-# ---------------------------------------------------------------
-# 4.  UPDATE via ORM (instance method)
-# ---------------------------------------------------------------
 subtest 'UPDATE capture – via ORM instance method' => sub {
     plan tests => 4;
     clean_tables();
@@ -157,8 +164,7 @@ subtest 'UPDATE capture – via ORM instance method' => sub {
     });
     $cdc->clear_events();
 
-    my ($emp) = @{ App::Schema->table('Employee')
-        ->select(-where => { email => 'bob@example.com' }) };
+    my $emp = _fetch_emp({ email => 'bob@example.com' });
     $emp->update({ salary => 80_000 });
 
     my $ev = $cdc->latest_event(table => 'employees', operation => 'UPDATE');
@@ -172,9 +178,6 @@ subtest 'UPDATE capture – via ORM instance method' => sub {
     like($new->{SALARY}, qr/^80000/, 'new salary is 80000');
 };
 
-# ---------------------------------------------------------------
-# 5.  DELETE via ORM
-# ---------------------------------------------------------------
 subtest 'DELETE capture – via ORM' => sub {
     plan tests => 4;
     clean_tables();
@@ -182,8 +185,7 @@ subtest 'DELETE capture – via ORM' => sub {
     App::Schema->table('Department')->insert({
         name => 'Marketing', location => 'Geneva',
     });
-    my ($dept) = @{ App::Schema->table('Department')
-        ->select(-where => { name => 'Marketing' }) };
+    my $dept = _fetch_dept({ name => 'Marketing' });
     $cdc->clear_events();
 
     $dept->delete();
@@ -197,11 +199,12 @@ subtest 'DELETE capture – via ORM' => sub {
     is($old->{NAME}, 'Marketing', 'old_data NAME correct');
 };
 
-# ---------------------------------------------------------------
-# 6.  ROLLBACK – no ghost events
-# ---------------------------------------------------------------
-subtest 'ROLLBACK – no CDC events emitted' => sub {
-    plan tests => 1;
+# ===============================================================
+# SECTION 3: TRANSACTION SAFETY
+# ===============================================================
+
+subtest 'ROLLBACK – explicit rollback discards DML and CDC events' => sub {
+    plan tests => 2;
     clean_tables();
 
     {
@@ -217,13 +220,12 @@ subtest 'ROLLBACK – no CDC events emitted' => sub {
     }
 
     is($cdc->count_events(table => 'departments'), 0,
-        'Zero events after ROLLBACK');
+        'Zero CDC events after ROLLBACK');
+    my ($n) = $dbh->selectrow_array('SELECT COUNT(*) FROM departments');
+    is($n, 0, 'Zero rows in departments after ROLLBACK');
 };
 
-# ---------------------------------------------------------------
-# 7.  COMMIT – multi-statement transaction
-# ---------------------------------------------------------------
-subtest 'COMMIT – multi-statement transaction' => sub {
+subtest 'COMMIT – multi-statement transaction commits atomically' => sub {
     plan tests => 3;
     clean_tables();
 
@@ -246,9 +248,259 @@ subtest 'COMMIT – multi-statement transaction' => sub {
         0, 'No DELETE events');
 };
 
-# ---------------------------------------------------------------
-# 8.  NULL column values
-# ---------------------------------------------------------------
+subtest 'AutoCommit ON – DML + CDC event are atomic (mini-transaction)' => sub {
+    plan tests => 2;
+    clean_tables();
+
+    # With AutoCommit ON (the default), the hook wraps DML + CDC
+    # write in a mini-transaction.  Both must succeed or neither.
+    ok($dbh->{AutoCommit}, 'AutoCommit is ON for this test');
+
+    App::Schema->table('Department')->insert({
+        name => 'Atomic', location => 'Bern',
+    });
+
+    # Verify both the row and the CDC event exist
+    my ($n) = $dbh->selectrow_array(
+        "SELECT COUNT(*) FROM departments WHERE name = 'Atomic'"
+    );
+    is($cdc->count_events(table => 'departments', operation => 'INSERT'),
+        $n, 'CDC event count matches row count (atomicity)');
+};
+
+subtest 'Transaction – INSERT + UPDATE + DELETE in single txn' => sub {
+    plan tests => 4;
+    clean_tables();
+
+    {
+        local $dbh->{AutoCommit} = 0;
+
+        App::Schema->table('Department')->insert({
+            name => 'Lifecycle', location => 'Bern',
+        });
+
+        my $dept = _fetch_dept({ name => 'Lifecycle' });
+        $dept->update({ location => 'Basel' });
+        $dept->delete();
+
+        $dbh->commit();
+    }
+
+    is($cdc->count_events(table => 'departments', operation => 'INSERT'),
+        1, 'INSERT event captured in txn');
+    is($cdc->count_events(table => 'departments', operation => 'UPDATE'),
+        1, 'UPDATE event captured in txn');
+    is($cdc->count_events(table => 'departments', operation => 'DELETE'),
+        1, 'DELETE event captured in txn');
+
+    my ($n) = $dbh->selectrow_array('SELECT COUNT(*) FROM departments');
+    is($n, 0, 'Row deleted after full lifecycle');
+};
+
+subtest 'Transaction – partial rollback after second insert fails' => sub {
+    plan tests => 2;
+    clean_tables();
+
+    my $caught = 0;
+    {
+        local $dbh->{AutoCommit} = 0;
+        try {
+            App::Schema->table('Department')->insert({
+                name => 'First', location => 'OK',
+            });
+            # Insert with name longer than VARCHAR2(100) to cause error
+            App::Schema->table('Department')->insert({
+                name => 'A' x 200, location => 'Overflow',
+            });
+            $dbh->commit();
+        } catch {
+            $caught = 1;
+            $dbh->rollback();
+        };
+    }
+
+    ok($caught, 'Exception caught on oversized insert');
+    is($cdc->count_events(table => 'departments'), 0,
+        'Zero CDC events — entire transaction rolled back');
+};
+
+subtest 'Transaction – interleaved tables in single txn' => sub {
+    plan tests => 2;
+    clean_tables();
+
+    {
+        local $dbh->{AutoCommit} = 0;
+
+        App::Schema->table('Department')->insert({
+            name => 'Multi', location => 'Zurich',
+        });
+        my $dept = _fetch_dept({ name => 'Multi' });
+
+        App::Schema->table('Employee')->insert({
+            department_id => $dept->{id},
+            first_name    => 'Zara',
+            last_name     => 'Koenig',
+            email         => 'zara@example.com',
+            salary        => 95_000,
+        });
+
+        $dbh->commit();
+    }
+
+    is($cdc->count_events(table => 'departments', operation => 'INSERT'),
+        1, 'Department INSERT captured');
+    is($cdc->count_events(table => 'employees', operation => 'INSERT'),
+        1, 'Employee INSERT captured in same txn');
+};
+
+subtest 'Constraint violation – no CDC event on failed INSERT' => sub {
+    plan tests => 2;
+    clean_tables();
+
+    App::Schema->table('Employee')->insert({
+        first_name => 'Eve',
+        last_name  => 'X',
+        email      => 'eve@example.com',
+        salary     => 50_000,
+    });
+    $cdc->clear_events();
+
+    my $failed = 0;
+    try {
+        App::Schema->table('Employee')->insert({
+            first_name => 'Eve2',
+            last_name  => 'Y',
+            email      => 'eve@example.com',  # duplicate unique key
+            salary     => 60_000,
+        });
+    } catch {
+        $failed = 1;
+    };
+
+    ok($failed, 'Duplicate INSERT correctly rejected');
+    is($cdc->count_events(table => 'employees'), 0,
+        'No CDC event for failed INSERT');
+};
+
+subtest 'Constraint violation in txn – rollback cleans all' => sub {
+    plan tests => 3;
+    clean_tables();
+
+    my $caught = 0;
+    {
+        local $dbh->{AutoCommit} = 0;
+        try {
+            App::Schema->table('Employee')->insert({
+                first_name => 'Good',
+                last_name  => 'Row',
+                email      => 'good@example.com',
+                salary     => 50_000,
+            });
+            App::Schema->table('Employee')->insert({
+                first_name => 'Good',
+                last_name  => 'Row',
+                email      => 'good@example.com',  # duplicate
+                salary     => 60_000,
+            });
+            $dbh->commit();
+        } catch {
+            $caught = 1;
+            $dbh->rollback();
+        };
+    }
+
+    ok($caught, 'Duplicate caught in transaction');
+    is($cdc->count_events(table => 'employees'), 0,
+        'Zero CDC events after txn rollback');
+    my ($n) = $dbh->selectrow_array('SELECT COUNT(*) FROM employees');
+    is($n, 0, 'Zero rows after txn rollback');
+};
+
+# ===============================================================
+# SECTION 3b: CLASS-METHOD UPDATE / DELETE
+# ===============================================================
+
+subtest 'Class-method UPDATE – captures per-row old/new' => sub {
+    plan tests => 5;
+    clean_tables();
+
+    my $dept_id = _insert_dept(name => 'ClassUpd', location => 'Bern');
+    for my $i (1..3) {
+        App::Schema->table('Employee')->insert({
+            department_id => $dept_id,
+            first_name    => "CM$i",
+            last_name     => "Last$i",
+            email         => "cm${i}\@example.com",
+            salary        => 50_000,
+        });
+    }
+    $cdc->clear_events();
+
+    App::Schema->table('Employee')->update(
+        -set   => { salary => 55_000 },
+        -where => { department_id => $dept_id },
+    );
+
+    is($cdc->count_events(table => 'employees', operation => 'UPDATE'),
+        3, 'One UPDATE event per affected row');
+
+    my $pairs = $cdc->event_pairs(table => 'employees');
+    is(scalar @$pairs, 3, 'Three pairs returned');
+
+    my ($old, $new) = @{ $pairs->[0] };
+    like($old->{SALARY}, qr/^50000/, 'old salary captured');
+    like($new->{SALARY}, qr/^55000/, 'new salary captured');
+    ok(defined $old->{FIRST_NAME}, 'Full row snapshot in old_data');
+};
+
+subtest 'Class-method DELETE – captures per-row old_data' => sub {
+    plan tests => 3;
+    clean_tables();
+
+    for my $i (1..2) {
+        App::Schema->table('Department')->insert({
+            name => "Del$i", location => 'X',
+        });
+    }
+    $cdc->clear_events();
+
+    App::Schema->table('Department')->delete(
+        -where => { location => 'X' },
+    );
+
+    is($cdc->count_events(table => 'departments', operation => 'DELETE'),
+        2, 'One DELETE event per affected row');
+
+    my $events = $cdc->events_for(table => 'departments', operation => 'DELETE');
+    my $old1 = $cdc->parse_row_image($events->[0]{old_data});
+    my $old2 = $cdc->parse_row_image($events->[1]{old_data});
+
+    ok(defined $old1->{NAME}, 'First deleted row has NAME in old_data');
+    ok(!defined $events->[0]{new_data}, 'new_data is NULL for DELETE');
+};
+
+subtest 'Class-method UPDATE with no matching rows – zero events' => sub {
+    plan tests => 1;
+    clean_tables();
+
+    App::Schema->table('Department')->insert({
+        name => 'NoMatch', location => 'X',
+    });
+    $cdc->clear_events();
+
+    App::Schema->table('Department')->update(
+        -set   => { location => 'Y' },
+        -where => { name => 'NonExistent' },
+    );
+
+    is($cdc->count_events(table => 'departments', operation => 'UPDATE'),
+        0, 'Zero events when no rows match');
+};
+
+# ===============================================================
+# SECTION 4: DATA INTEGRITY & EDGE CASES
+# ===============================================================
+
 subtest 'NULL column values captured correctly' => sub {
     plan tests => 3;
     clean_tables();
@@ -266,9 +518,27 @@ subtest 'NULL column values captured correctly' => sub {
     is($new->{LOCATION}, undef,   'NULL LOCATION parsed as undef');
 };
 
-# ---------------------------------------------------------------
-# 9.  Bulk INSERT via ORM – one event per row
-# ---------------------------------------------------------------
+subtest 'UPDATE preserves unchanged columns in new_data' => sub {
+    plan tests => 3;
+    clean_tables();
+
+    App::Schema->table('Department')->insert({
+        name => 'Stable', location => 'Bern',
+    });
+    my $dept = _fetch_dept({ name => 'Stable' });
+    $cdc->clear_events();
+
+    $dept->update({ location => 'Basel' });
+
+    my $ev  = $cdc->latest_event(table => 'departments', operation => 'UPDATE');
+    my $old = $cdc->parse_row_image($ev->{old_data});
+    my $new = $cdc->parse_row_image($ev->{new_data});
+
+    is($old->{NAME}, $new->{NAME}, 'Unchanged NAME identical in old/new');
+    is($old->{ID},   $new->{ID},   'PK unchanged between old/new');
+    isnt($old->{LOCATION}, $new->{LOCATION}, 'Changed LOCATION differs');
+};
+
 subtest 'Bulk INSERT via ORM – one event per row' => sub {
     plan tests => 1;
     clean_tables();
@@ -290,10 +560,32 @@ subtest 'Bulk INSERT via ORM – one event per row' => sub {
         5, '5 INSERT events captured');
 };
 
-# ---------------------------------------------------------------
-# 10. Cross-table FK – parent and child tracked
-# ---------------------------------------------------------------
-subtest 'Cross-table FK – INSERT on parent and child tracked' => sub {
+subtest 'Bulk UPDATE via ORM – one event per row' => sub {
+    plan tests => 1;
+    clean_tables();
+
+    my $dept_id = _insert_dept(name => 'BulkU', location => 'Bern');
+    for my $i (1..3) {
+        App::Schema->table('Employee')->insert({
+            department_id => $dept_id,
+            first_name    => "Upd$i",
+            last_name     => "Last$i",
+            email         => "upd${i}\@example.com",
+            salary        => 60_000,
+        });
+    }
+    $cdc->clear_events();
+
+    for my $emp (@{ App::Schema->table('Employee')
+            ->select(-where => { department_id => $dept_id }) }) {
+        $emp->update({ salary => 65_000 });
+    }
+
+    is($cdc->count_events(table => 'employees', operation => 'UPDATE'),
+        3, '3 UPDATE events for 3 rows');
+};
+
+subtest 'Cross-table FK – parent and child tracked' => sub {
     plan tests => 4;
     clean_tables();
 
@@ -320,9 +612,6 @@ subtest 'Cross-table FK – INSERT on parent and child tracked' => sub {
     is($emp_row->{DEPARTMENT_ID}, $dept_id,   'FK to department captured');
 };
 
-# ---------------------------------------------------------------
-# 11. Special characters and encoding
-# ---------------------------------------------------------------
 subtest 'Special characters – accents, apostrophe, dash' => sub {
     plan tests => 2;
     clean_tables();
@@ -340,9 +629,6 @@ subtest 'Special characters – accents, apostrophe, dash' => sub {
     is($new->{NAME}, $name, 'Special characters round-trip correctly');
 };
 
-# ---------------------------------------------------------------
-# 12. CDC event metadata
-# ---------------------------------------------------------------
 subtest 'CDC event metadata – event_id, event_time, table_name' => sub {
     plan tests => 4;
     clean_tables();
@@ -356,10 +642,31 @@ subtest 'CDC event metadata – event_id, event_time, table_name' => sub {
     is($ev->{table_name}, 'DEPARTMENTS', 'table_name is stored in upper-case');
 };
 
-# ---------------------------------------------------------------
-# 13. event_pairs() helper – UPDATE old/new as paired hashes
-# ---------------------------------------------------------------
-subtest 'CDC::Manager event_pairs() helper' => sub {
+subtest 'Event ordering – events ordered by event_id ASC' => sub {
+    plan tests => 2;
+    clean_tables();
+
+    for my $i (1..3) {
+        App::Schema->table('Department')->insert({
+            name => "Ordered$i", location => 'X',
+        });
+    }
+
+    my $events = $cdc->events_for(table => 'departments');
+    is(scalar @$events, 3, 'Three events captured');
+
+    my $ordered = 1;
+    for my $i (1 .. $#$events) {
+        $ordered = 0 if $events->[$i]{event_id} <= $events->[$i-1]{event_id};
+    }
+    ok($ordered, 'Events are in ascending event_id order');
+};
+
+# ===============================================================
+# SECTION 5: HELPER METHODS
+# ===============================================================
+
+subtest 'event_pairs() helper – UPDATE old/new as paired hashes' => sub {
     plan tests => 3;
     clean_tables();
 
@@ -375,10 +682,8 @@ subtest 'CDC::Manager event_pairs() helper' => sub {
     }
     $cdc->clear_events();
 
-    for my $emp (
-        @{ App::Schema->table('Employee')
-            ->select(-where => { department_id => $dept_id }) }
-    ) {
+    for my $emp (@{ App::Schema->table('Employee')
+            ->select(-where => { department_id => $dept_id }) }) {
         $emp->update({ salary => 65_000 });
     }
 
@@ -390,41 +695,50 @@ subtest 'CDC::Manager event_pairs() helper' => sub {
     like($new0->{SALARY}, qr/^65000/, 'First new salary is 65000');
 };
 
-# ---------------------------------------------------------------
-# 14. Constraint violation – no CDC event on failed DML
-# ---------------------------------------------------------------
-subtest 'Constraint violation – no CDC event on failed ORM insert' => sub {
+subtest 'count_events filters by operation' => sub {
+    plan tests => 4;
+    clean_tables();
+
+    App::Schema->table('Department')->insert({
+        name => 'Count', location => 'Bern',
+    });
+    my $dept = _fetch_dept({ name => 'Count' });
+    $dept->update({ location => 'Basel' });
+
+    is($cdc->count_events(table => 'departments'), 2, 'Total events = 2');
+    is($cdc->count_events(table => 'departments', operation => 'INSERT'),
+        1, 'INSERT count = 1');
+    is($cdc->count_events(table => 'departments', operation => 'UPDATE'),
+        1, 'UPDATE count = 1');
+    is($cdc->count_events(table => 'departments', operation => 'DELETE'),
+        0, 'DELETE count = 0');
+};
+
+subtest 'clear_events_for clears only one table' => sub {
     plan tests => 2;
     clean_tables();
 
+    my $dept_id = _insert_dept(name => 'Selective', location => 'X');
     App::Schema->table('Employee')->insert({
-        first_name => 'Eve',
-        last_name  => 'X',
-        email      => 'eve@example.com',
-        salary     => 50_000,
+        department_id => $dept_id,
+        first_name    => 'Sel',
+        last_name     => 'Test',
+        email         => 'sel@example.com',
+        salary        => 50_000,
     });
-    $cdc->clear_events();
 
-    my $failed = 0;
-    try {
-        App::Schema->table('Employee')->insert({
-            first_name => 'Eve2',
-            last_name  => 'Y',
-            email      => 'eve@example.com',  # duplicate
-            salary     => 60_000,
-        });
-    } catch {
-        $failed = 1;
-    };
+    $cdc->clear_events_for(table => 'departments');
 
-    ok($failed, 'Duplicate INSERT correctly rejected');
-    is($cdc->count_events(table => 'employees'), 0,
-        'No CDC event recorded for failed INSERT');
+    is($cdc->count_events(table => 'departments'), 0,
+        'Department events cleared');
+    is($cdc->count_events(table => 'employees'), 1,
+        'Employee events preserved');
 };
 
-# ---------------------------------------------------------------
-# 15. Raw DBI bypass – ORM hooks do not capture raw SQL
-# ---------------------------------------------------------------
+# ===============================================================
+# SECTION 6: DESIGN TRADE-OFFS
+# ===============================================================
+
 subtest 'Raw DBI bypass – not captured (expected trade-off)' => sub {
     plan tests => 1;
     clean_tables();
