@@ -1,0 +1,13 @@
+Revision history for DBIx-DataModel-Plugin-CDC
+
+1.01  2026-04-03
+    - Initial CPAN release.
+    - CDC::Table — table_parent class for insert/update/delete capture.
+    - CDC::Event — event envelope with time-based IDs, changed_columns diff.
+    - Handler::DBI — JSON persistence to database table (in_transaction).
+    - Handler::Callback — user coderef with configurable phase and error policy.
+    - Handler::Log — structured STDERR logging (post_commit).
+    - Handler::Multi — fan-out dispatcher with per-handler error isolation.
+    - Transaction safety: mini-transaction wrapping, TOCTOU protection.
+    - Follows DBIx::DataModel conventions: raw bless, Params::Validate,
+      namespace::clean, croak, define_abstract_methods.

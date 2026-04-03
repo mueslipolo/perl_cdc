@@ -1,0 +1,26 @@
+# Version control
+\B\.git\b
+\.gitignore$
+
+# Build artifacts
+^MYMETA\.
+^Makefile$
+^blib/
+^pm_to_blib$
+^_build/
+^Build$
+\.o$
+\.bs$
+
+# Editor files
+~$
+\.swp$
+\.bak$
+
+# OS files
+\.DS_Store$
+^\.claude/
+
+# Example PoC (not part of the distribution)
+^examples/oracle-cdc-poc/docker/
+^examples/oracle-cdc-poc/\.dockerignore$

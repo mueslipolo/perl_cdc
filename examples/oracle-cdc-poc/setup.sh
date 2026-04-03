@@ -6,6 +6,7 @@ set -euo pipefail
 # Copyright: Yves. Apache 2.0
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 readonly MAX_WAIT=300
 cd "${SCRIPT_DIR}"
 
@@ -14,9 +15,9 @@ info() { printf "${BLUE}[INFO]${NC}  %s\n" "$*"; }
 ok()   { printf "${GREEN}[OK]${NC}    %s\n" "$*"; }
 die()  { printf "${RED}[ERR]${NC}   %s\n" "$*" >&2; exit 1; }
 
-# ─── Build app image ────────────────────────────────────────────────────
-info "Building Perl app image (downloads Oracle Instant Client inside container)..."
-podman build -f docker/Dockerfile.app -t cdc-poc-app .
+# ─── Build app image (from repo root for full build context) ────
+info "Building Perl app image..."
+podman build -f docker/Dockerfile.app -t cdc-poc-app "${REPO_ROOT}"
 ok "App image built"
 
 # ─── Start Oracle ───────────────────────────────────────────────────────

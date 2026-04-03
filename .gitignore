@@ -1,4 +1,23 @@
+# Build artifacts
+Makefile
+MYMETA.*
+blib/
+pm_to_blib
+*.o
+*.bs
+_build/
+Build
+
+# CPAN dist
+DBIx-DataModel-Plugin-CDC-*
+
+# Perl
 perl5/
 local/
 *.bak
+
+# Environment
 .env
+
+# IDE
+.claude/

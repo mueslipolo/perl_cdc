@@ -19,8 +19,8 @@ services:
 
   app:
     build:
-      context: .
-      dockerfile: docker/Dockerfile.app
+      context: ../..
+      dockerfile: examples/oracle-cdc-poc/docker/Dockerfile.app
     container_name: cdc-app
     environment:
       ORACLE_DSN: "dbi:Oracle:host=oracle;port=1521;service_name=FREEPDB1"

@@ -1,5 +1,5 @@
 # Perl test runner with Oracle Instant Client
-# No Oracle libs needed on the host — everything runs in containers.
+# Build context should be the repository root.
 FROM docker.io/library/perl:5.40-slim-bookworm
 
 ARG ORA_CLIENT_URL_BASIC=https://download.oracle.com/otn_software/linux/instantclient/2370000/instantclient-basic-linux.x64-23.7.0.25.01.zip
@@ -22,11 +22,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY cpanfile .
+# Install deps from example cpanfile (includes DBD::Oracle)
+COPY examples/oracle-cdc-poc/cpanfile .
 RUN cpanm --quiet --notest --installdeps .
 
+# Plugin library and unit tests
 COPY lib/ lib/
 COPY t/   t/
 
+# Example app library and integration tests
+COPY examples/oracle-cdc-poc/lib/ examples/lib/
+COPY examples/oracle-cdc-poc/t/   examples/t/
+
 USER nobody
-CMD ["prove", "-lv", "t/"]
+CMD ["prove", "-Ilib", "-Iexamples/lib", "-lv", "examples/t/"]

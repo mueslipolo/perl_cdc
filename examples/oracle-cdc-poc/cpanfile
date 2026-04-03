@@ -1,0 +1,11 @@
+# Example PoC dependencies — run inside the Docker container
+requires 'DBIx::DataModel',  '>= 3.0';
+requires 'DBD::Oracle',      '>= 1.83';
+requires 'DBI',              '>= 1.643';
+requires 'Cpanel::JSON::XS';
+requires 'Params::Validate';
+requires 'Try::Tiny';
+requires 'Scalar::Util';
+requires 'namespace::clean';
+requires 'Test::More',       '>= 1.302';
+requires 'Test::Exception';

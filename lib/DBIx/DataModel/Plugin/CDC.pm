@@ -195,7 +195,7 @@ __END__
 
 =head1 NAME
 
-DBIx::DataModel::Plugin::CDC — Change Data Capture for DBIx::DataModel
+DBIx::DataModel::Plugin::CDC - Change Data Capture for DBIx::DataModel
 
 =head1 SYNOPSIS
 
