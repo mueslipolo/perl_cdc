@@ -5,8 +5,8 @@
 
 Captures INSERT, UPDATE, and DELETE events by extending the ORM's own
 `table_parent` inheritance mechanism.  No database triggers, stored
-procedures, or DDL privileges required.  Pluggable handlers dispatch
-events to a database table, message queue, webhook, or custom callback.
+procedures, or DDL privileges required.  Listeners dispatch events to
+a database table, message queue, webhook, or custom callback.
 
 Database-agnostic.  Works with any DBI-supported backend.
 
@@ -30,7 +30,6 @@ perl Makefile.PL && make && make test && make install
 use DBIx::DataModel;
 use DBIx::DataModel::Plugin::CDC;
 use DBIx::DataModel::Plugin::CDC::Table;
-use DBIx::DataModel::Plugin::CDC::Handler::DBI;
 
 # 1. Declare schema with CDC table_parent
 DBIx::DataModel->Schema('App::Schema',
@@ -41,14 +40,14 @@ App::Schema->Table(Employee   => 'employees',   'id');
 
 # 2. Connect and configure CDC
 App::Schema->dbh($dbh);
-DBIx::DataModel::Plugin::CDC->setup('App::Schema',
-    tables   => 'all',
-    handlers => [
-        DBIx::DataModel::Plugin::CDC::Handler::DBI->new(
-            table_name => 'cdc_events',
-        ),
-    ],
-);
+
+DBIx::DataModel::Plugin::CDC
+    ->setup('App::Schema', tables => 'all')
+    ->log_to_dbi('App::Schema', 'cdc_events')
+    ->on('App::Schema', '*' => sub {
+        my ($event, $schema) = @_;
+        # push to Redis, webhook, etc.
+    });
 
 # 3. Use the ORM normally — events are captured automatically
 App::Schema->table('Department')->insert({ name => 'Engineering' });
@@ -81,9 +80,9 @@ App::Schema->table('Department')->insert({ name => 'Engineering' });
 4. The **original `insert()`** executes — normal SQL, normal result.
 5. An **event envelope** is built with a unique ID, timestamp, table name,
    operation type, and the new row data as a Perl hashref.
-6. The event is **dispatched to handlers**:
-   - `in_transaction` handlers (e.g., DBI) run inside the DB transaction.
-   - `post_commit` handlers (e.g., Callback) run after commit.
+6. The event is **dispatched to listeners**:
+   - `in_transaction` listeners (e.g., `log_to_dbi`) run inside the DB transaction.
+   - `post_commit` listeners (e.g., custom `->on()` callbacks) run after commit.
 7. The mini-transaction **commits**.  Both the row and the CDC event are durable.
 
 ### UPDATE and DELETE
@@ -118,13 +117,13 @@ All CDC operations are **atomic with the DML**:
 |---|---|
 | `AutoCommit` ON | Mini-transaction wraps DML + CDC event |
 | `AutoCommit` OFF | Your transaction governs both |
-| Inside `do_transaction` | Post-commit handlers deferred via `do_after_commit` |
+| Inside `do_transaction` | Post-commit listeners deferred via `do_after_commit` |
 | DML fails (constraint violation) | CDC event never written |
-| `in_transaction` handler fails (`abort` policy) | DML rolled back |
-| `post_commit` handler fails | DML already committed — data safe |
+| `in_transaction` listener fails (`abort` policy) | DML rolled back |
+| `post_commit` listener fails | DML already committed — data safe |
 
 There is **no window** where a DML is committed without its CDC event (for
-`in_transaction` handlers).  Both are in the same database transaction.
+`in_transaction` listeners).  Both are in the same database transaction.
 
 ---
 
@@ -146,11 +145,10 @@ There is **no window** where a DML is committed without its CDC event (for
         │     │
         │     ├─ Event::build()            ← event envelope
         │     │
-        │     └─ CDC::dispatch()           ← routes to handlers
+        │     └─ CDC::dispatch()           ← routes to listeners
         │           │
-        │           ├─ Handler::DBI        (in_transaction → JSON to DB)
-        │           ├─ Handler::Callback   (post_commit → your coderef)
-        │           └─ Handler::Log        (post_commit → STDERR)
+        │           ├─ log_to_dbi          (in_transaction → JSON to DB)
+        │           └─ ->on() callbacks    (post_commit → your code)
         │
         └─ commit (or rollback on error)
 ```
@@ -158,17 +156,14 @@ There is **no window** where a DML is committed without its CDC event (for
 ### Module Structure
 
 ```
-DBIx::DataModel::Plugin::CDC
-├── CDC.pm              Registry, dispatch, query helpers
-├── CDC/Table.pm        table_parent class — overrides insert/update/delete
-├── CDC/Event.pm        Builds event envelopes (ID, timestamp, diff)
-├── CDC/Handler.pm      Abstract base class (enforces interface contract)
-└── CDC/Handler/
-    ├── DBI.pm          Writes JSON to a database table (in_transaction)
-    ├── Callback.pm     Calls user coderef (configurable phase)
-    ├── Log.pm          Prints to STDERR (post_commit, for debugging)
-    └── Multi.pm        Combines handlers with per-handler error policies
+DBIx::DataModel::Plugin::
+├── CDC.pm         setup(), on(), log_to_dbi(), log_to_stderr(),
+│                  dispatch, query helpers
+├── CDC/Table.pm   table_parent — overrides insert/update/delete
+└── CDC/Event.pm   event envelope builder (ID, timestamp, diff)
 ```
+
+Three modules.  That's it.
 
 ---
 
@@ -191,34 +186,36 @@ App::Schema->Table(Employee   => 'employees',   'id');
 The `table_parent` line is the only change to your schema declaration.
 All table classes now inherit CDC-aware `insert`, `update`, and `delete`.
 
-### 2. Configure Handlers
+### 2. Configure Listeners
 
 ```perl
 use DBIx::DataModel::Plugin::CDC;
-use DBIx::DataModel::Plugin::CDC::Handler::DBI;
-use DBIx::DataModel::Plugin::CDC::Handler::Callback;
 
 App::Schema->dbh($dbh);
 
-DBIx::DataModel::Plugin::CDC->setup('App::Schema',
-    tables   => 'all',                    # or ['Department']
-    handlers => [
-        # Write events to the cdc_events table (same transaction)
-        DBIx::DataModel::Plugin::CDC::Handler::DBI->new(
-            table_name => 'cdc_events',
-        ),
+DBIx::DataModel::Plugin::CDC
+    ->setup('App::Schema', tables => 'all')    # or tables => ['Department']
 
-        # Custom logic after commit (e.g., push to Redis)
-        DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-            phase    => 'post_commit',
-            on_event => sub {
-                my ($event, $schema) = @_;
-                # $event is a hashref — see "Event Envelope" below
-            },
-        ),
-    ],
-);
+    # Built-in: persist events as JSON to a DB table (in_transaction, abort on error)
+    ->log_to_dbi('App::Schema', 'cdc_events')
+
+    # Built-in: one-line structured log to STDERR (post_commit)
+    ->log_to_stderr('App::Schema')
+
+    # Custom: your code, any operation
+    ->on('App::Schema', '*' => sub {
+        my ($event, $schema) = @_;
+        # push to Redis, webhook, Kafka...
+    })
+
+    # Custom: only inserts, inside the transaction, abort on failure
+    ->on('App::Schema', 'INSERT' => sub {
+        my ($event, $schema) = @_;
+        # critical audit check
+    }, { phase => 'in_transaction', on_error => 'abort' });
 ```
+
+All methods return `$class` for chaining.
 
 ### 3. Use the ORM Normally
 
@@ -240,25 +237,23 @@ App::Schema->table('Employee')->update(
 
 ### 4. Query Events
 
+Requires `log_to_dbi()` to have been configured.
+
 ```perl
 my $CDC = 'DBIx::DataModel::Plugin::CDC';
 
-# All events for a table
 my $events = $CDC->events_for('App::Schema',
     table => 'employees', operation => 'UPDATE');
 
-# Latest event
 my $last = $CDC->latest_event('App::Schema',
     table => 'employees', operation => 'INSERT');
 
-# Count
 my $n = $CDC->count_events('App::Schema', table => 'employees');
 
 # UPDATE pairs (old/new as decoded hashrefs)
 my $pairs = $CDC->event_pairs('App::Schema', table => 'employees');
-# [ [\%old, \%new], [\%old, \%new], ... ]
+# [ [\%old, \%new], ... ]
 
-# Cleanup
 $CDC->clear_events('App::Schema');
 $CDC->clear_events_for('App::Schema', table => 'employees');
 ```
@@ -267,7 +262,7 @@ $CDC->clear_events_for('App::Schema', table => 'employees');
 
 ## Event Envelope
 
-Every handler receives an event hashref with this structure:
+Every listener receives an event hashref with this structure:
 
 ```perl
 {
@@ -289,82 +284,37 @@ Every handler receives an event hashref with this structure:
 | `new_data` | hashref (after) | hashref (after) | `undef` |
 | `changed_columns` | `undef` | arrayref | `undef` |
 
-The DBI handler serializes `old_data`/`new_data` to JSON when writing to
-the database.  Callback handlers receive the raw Perl hashrefs.
+`log_to_dbi` serializes `old_data`/`new_data` to JSON.  Custom `->on()`
+listeners receive the raw Perl hashrefs.
 
 Event IDs are time-based and monotonically increasing within a process:
 `<seconds>-<microseconds>-<pid>-<counter>`.
 
 ---
 
-## Handlers
+## Listener API
 
-### Handler::DBI — Database Persistence
+### `->on($schema, $operation, \&callback, \%opts?)`
 
-Writes each event as a row in a database table, inside the same transaction
-as the DML.  This is the primary audit trail.
-
-```perl
-DBIx::DataModel::Plugin::CDC::Handler::DBI->new(
-    table_name => 'cdc_events',    # default; validated against SQL injection
-);
-```
-
-- **Phase**: `in_transaction` — atomic with the DML
-- **Serialization**: JSON via `Cpanel::JSON::XS`
-- **Performance**: uses a prepared statement cache (one `prepare` per `$dbh`)
-- **Failure**: exception propagates → transaction rolls back (DML + event)
-
-### Handler::Callback — Custom Logic
-
-Calls a user-provided coderef for each event.
+Register a listener.  `$operation` is `'INSERT'`, `'UPDATE'`, `'DELETE'`,
+or `'*'` (all operations).
 
 ```perl
-DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-    on_event => sub {
-        my ($event, $schema) = @_;
-        # $event is the hashref shown above
-        # $schema is the DBIx::DataModel schema object
-    },
-    phase    => 'post_commit',     # or 'in_transaction'
-    on_error => 'warn',            # or 'abort', 'ignore'
-);
+$CDC->on('App::Schema', '*' => sub {
+    my ($event, $schema) = @_;
+    # ...
+}, {
+    phase    => 'post_commit',     # default; or 'in_transaction'
+    on_error => 'warn',            # default; or 'abort', 'ignore'
+});
 ```
 
-Use `in_transaction` if you need database access via `$schema->dbh`.
-Use `post_commit` for external systems (queues, webhooks) — a failure
-won't roll back the DML.
+**Phases:**
 
-### Handler::Log — Debugging
-
-Prints a structured one-line log to STDERR.
-
-```perl
-DBIx::DataModel::Plugin::CDC::Handler::Log->new(
-    prefix => 'CDC',               # default
-);
-# Output: [CDC] DEPARTMENTS INSERT 680e3a1f-0a2b-1a3c-0001
-```
-
-- **Phase**: `post_commit`
-
-### Handler::Multi — Fan-Out
-
-Combines multiple handlers with error isolation and per-handler policies.
-
-```perl
-DBIx::DataModel::Plugin::CDC::Handler::Multi->new(
-    handlers => [
-        DBIx::DataModel::Plugin::CDC::Handler::DBI->new(...),
-        DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-            on_event => sub { ... },
-            phase    => 'post_commit',
-            on_error => 'warn',       # per-handler policy
-        ),
-    ],
-    on_error => 'warn',               # fallback policy
-);
-```
+| Phase | When | Has DB access? | Can rollback DML? |
+|---|---|---|---|
+| `in_transaction` | Before commit | Yes, same `$dbh` | Yes, on failure |
+| `post_commit` | After commit | No | No |
 
 **Error policies:**
 
@@ -374,24 +324,41 @@ DBIx::DataModel::Plugin::CDC::Handler::Multi->new(
 | `warn` | Warning emitted → DML commits normally |
 | `ignore` | Silently suppressed (logs with `CDC_DEBUG=1` env var) |
 
-### Writing Your Own Handler
+### `->log_to_dbi($schema, $table_name?)`
 
-Inherit from `Handler` and implement two methods:
+Built-in listener: persist events as JSON to a database table.  Defaults
+to `'cdc_events'`.  Runs `in_transaction` with `abort` on error.
+
+Table name is validated against SQL injection (`/\A[a-zA-Z_]\w*\z/`).
+Uses a prepared statement cache for performance.
+
+### `->log_to_stderr($schema, $prefix?)`
+
+Built-in listener: print `[CDC] TABLE OPERATION event_id` to STDERR.
+Defaults prefix to `'CDC'`.  Runs `post_commit` with `ignore` on error.
+
+### Writing a Custom Listener
+
+A listener is just a coderef that accepts `($event, $schema)`:
 
 ```perl
-package My::Handler::Webhook;
-use parent 'DBIx::DataModel::Plugin::CDC::Handler';
+# Send to Redis Streams
+$CDC->on('App::Schema', '*' => sub {
+    my ($event, $schema) = @_;
+    $redis->xadd('cdc:events', '*',
+        table     => $event->{table_name},
+        operation => $event->{operation},
+        payload   => encode_json($event),
+    );
+}, { phase => 'post_commit' });
 
-sub phase { 'post_commit' }
-
-sub dispatch_event {
-    my ($self, $event, $schema) = @_;
-    # POST $event to a webhook, write to Kafka, etc.
-}
+# Wrap an object method
+my $auditor = My::Auditor->new;
+$CDC->on('App::Schema', '*' => sub { $auditor->handle(@_) },
+    { phase => 'in_transaction', on_error => 'abort' });
 ```
 
-The base class enforces the contract: if you forget to implement
-`dispatch_event` or `phase`, you get a clear error at call time.
+No base class to inherit.  No interface to implement.  Just a sub.
 
 ---
 
@@ -440,21 +407,15 @@ Optimizations applied:
 DBIx-DataModel-Plugin-CDC/
 ├── lib/
 │   └── DBIx/DataModel/Plugin/
-│       ├── CDC.pm                    # Registry, dispatch, query helpers
+│       ├── CDC.pm                    # setup, on, log_to_dbi, dispatch, queries
 │       └── CDC/
 │           ├── Table.pm              # table_parent (insert/update/delete)
-│           ├── Event.pm              # Event envelope builder
-│           ├── Handler.pm            # Abstract base class
-│           └── Handler/
-│               ├── DBI.pm            # JSON → database table
-│               ├── Callback.pm       # User coderef
-│               ├── Log.pm            # STDERR structured log
-│               └── Multi.pm          # Fan-out + error policies
+│           └── Event.pm              # Event envelope builder
 ├── t/                                # Unit tests (no database required)
 │   ├── 00_compile.t                  # All modules load
 │   ├── 01_event.t                    # Event envelope, IDs, validation
-│   ├── 02_handler_base.t            # Contract enforcement, constructors
-│   ├── 03_handler_multi.t           # Dispatch, phases, error policies
+│   ├── 02_handler_base.t            # on(), log_to_dbi, log_to_stderr validation
+│   ├── 03_handler_multi.t           # Dispatch, operation filtering, error policies
 │   └── 04_setup.t                    # Registry, selective tables
 ├── examples/
 │   └── oracle-cdc-poc/               # Integration example (Oracle)
@@ -473,17 +434,17 @@ DBIx-DataModel-Plugin-CDC/
 
 ## Test Coverage
 
-**77 total tests**: 28 unit + 49 integration.
+**74 total tests**: 25 unit + 49 integration.
 
 ### Unit Tests (t/ — no database, runs on CPAN smoke)
 
 | File | Tests | Covers |
 |---|---|---|
-| `00_compile.t` | 8 | All modules load cleanly |
-| `01_event.t` | 18 | Event::build, unique IDs (1000 generated), ISO 8601 timestamps, changed_columns diff, validation (missing/invalid fields) |
-| `02_handler_base.t` | 14 | Abstract method enforcement, DBI table_name SQL injection rejection, Callback phase/on_error validation, Log defaults, Multi empty-handlers rejection |
-| `03_handler_multi.t` | 9 | Dispatch ordering, phase separation (in_transaction vs post_commit), has_post_commit_handlers, abort/warn/ignore error policies |
-| `04_setup.t` | 11 | Registry with `tables => 'all'` and selective, is_tracked on unconfigured schema, missing args validation |
+| `00_compile.t` | 3 | All 3 modules load cleanly |
+| `01_event.t` | 18 | Event::build, unique IDs (1000), ISO 8601 timestamps, changed_columns, validation |
+| `02_handler_base.t` | 16 | `on()` validation (phase, on_error, coderef), `log_to_dbi` SQL injection rejection, `log_to_stderr`, chaining |
+| `03_handler_multi.t` | 10 | Operation filtering, wildcard, listener ordering, abort/warn/ignore error policies, abort propagation |
+| `04_setup.t` | 7 | Registry with `tables => 'all'` and selective, `is_tracked`, validation |
 
 ### Integration Tests (examples/oracle-cdc-poc/t/ — needs Oracle)
 
@@ -494,7 +455,7 @@ DBIx-DataModel-Plugin-CDC/
 | Class-method ops | 3 | Bulk UPDATE/DELETE per-row, no-match zero events |
 | Data integrity | 8 | NULL, unchanged columns, bulk, FK, UTF-8, empty string, update history, JSON round-trip |
 | Metadata & helpers | 5 | event_id, ordering, event_pairs, count filter, selective clear |
-| Plugin features | 10 | Callback envelope, changed_columns, Multi dispatch, abort/warn policies, Handler::Log |
+| Plugin features | 10 | Callback envelope, changed_columns, multiple listeners, abort/warn policies, log_to_stderr |
 | Relationships | 5 | FK parent/child, cross-table rollback, snapshot filters refs, rapid multi-table ops |
 | Performance | 4 | INSERT/UPDATE/DELETE throughput (ORM vs ORM+CDC), batch in txn |
 | Trade-offs | 1 | Raw DBI bypass confirmation |
@@ -503,15 +464,12 @@ DBIx-DataModel-Plugin-CDC/
 
 ## Design Philosophy
 
-This plugin follows DBIx::DataModel's own coding conventions:
-
-- **Raw `bless`**, not Moo/Moose — table rows are plain hashrefs
-- **`Params::Validate`** for constructor argument checking
-- **`namespace::clean`** on all modules
-- **`croak`** for errors (string exceptions, not objects)
-- **Abstract base class** (`Handler.pm`) using `define_abstract_methods`
-  from `DBIx::DataModel::Meta::Utils`
-- **Zero framework dependencies** beyond what DBIx::DataModel already uses
+- **Event emitter pattern** — listeners are coderefs, not classes.  `->on()` is the only API.
+- **Built-in shortcuts** — `log_to_dbi()` and `log_to_stderr()` cover the common cases without any user code.
+- **Three modules total** — `CDC.pm`, `Table.pm`, `Event.pm`.  No handler classes, no abstract base, no Multi dispatcher.
+- **`namespace::clean`** on all modules.
+- **`croak`** for errors (string exceptions).
+- **Zero framework dependencies** beyond what DBIx::DataModel already uses.
 
 ---
 
@@ -529,10 +487,9 @@ This plugin follows DBIx::DataModel's own coding conventions:
 ## Future Extensions
 
 - **Transactional outbox** — buffer events, relay to Kafka/RabbitMQ asynchronously
-- **Handler::Redis** — Redis Streams (`XADD`) for lightweight event streaming
-- **Handler::AMQP** — RabbitMQ with publisher confirms
-- **Per-table handler config** — different handlers for different tables
+- **Per-table listener config** — different listeners for different tables
 - **Column filtering** — skip specific columns from CDC capture
+- **Operation-specific `log_to_dbi`** — only persist certain operations
 
 ---
 
@@ -540,7 +497,6 @@ This plugin follows DBIx::DataModel's own coding conventions:
 
 - [DBIx::DataModel on CPAN](https://metacpan.org/pod/DBIx::DataModel)
 - [Cpanel::JSON::XS on CPAN](https://metacpan.org/pod/Cpanel::JSON::XS)
-- [Params::Validate on CPAN](https://metacpan.org/pod/Params::Validate)
 - [Transactional Outbox Pattern](https://microservices.io/patterns/data/transactional-outbox.html)
 
 ---
