@@ -58,12 +58,22 @@ App::Schema->dbh($dbh);
 # Callback event collector
 my @callback_events;
 
-DBIx::DataModel::Plugin::CDC
-    ->setup('App::Schema', tables => 'all')
-    ->log_to_dbi('App::Schema', 'cdc_events')
-    ->on('App::Schema', '*' => sub {
-        push @callback_events, $_[0];
-    });
+sub _setup_cdc {
+    my (%opts) = @_;
+    my $capture_old = $opts{capture_old} // 1;
+    @callback_events = ();
+    DBIx::DataModel::Plugin::CDC
+        ->setup('App::Schema',
+            tables      => 'all',
+            capture_old => $capture_old)
+        ->log_to_dbi('App::Schema', 'cdc_events')
+        ->on('App::Schema', '*' => sub {
+            push @callback_events, $_[0];
+        });
+}
+
+# Default: capture_old => 1 for the existing test suite
+_setup_cdc(capture_old => 1);
 
 # ---------------------------------------------------------------
 # Helpers
@@ -652,13 +662,10 @@ subtest 'Multiple listeners both fire' => sub {
     plan tests => 3;
     clean_tables();
 
-    # Reset and reconfigure with an extra in_transaction listener
     my @extra_events;
-    $CDC->setup('App::Schema', tables => 'all')
-        ->log_to_dbi('App::Schema', 'cdc_events')
-        ->on('App::Schema', '*' => sub { push @callback_events, $_[0] })
-        ->on('App::Schema', 'INSERT' => sub { push @extra_events, $_[0] },
-            { phase => 'in_transaction' });
+    _setup_cdc(capture_old => 1);
+    $CDC->on('App::Schema', 'INSERT' => sub { push @extra_events, $_[0] },
+        { phase => 'in_transaction' });
 
     App::Schema->table('Department')->insert({ name => 'Multi', location => 'X' });
 
@@ -667,20 +674,17 @@ subtest 'Multiple listeners both fire' => sub {
     ok(@extra_events >= 1, 'Extra in_transaction listener fired');
     is($extra_events[-1]{operation}, 'INSERT', 'Got INSERT');
 
-    # Restore standard config
-    $CDC->setup('App::Schema', tables => 'all')
-        ->log_to_dbi('App::Schema', 'cdc_events')
-        ->on('App::Schema', '*' => sub { push @callback_events, $_[0] });
+    # Restore
+    _setup_cdc(capture_old => 1);
 };
 
 subtest 'Error policy: warn – DML succeeds and commits' => sub {
     plan tests => 4;
     clean_tables();
 
-    $CDC->setup('App::Schema', tables => 'all')
-        ->log_to_dbi('App::Schema', 'cdc_events')
-        ->on('App::Schema', '*' => sub { die "Intentional failure" },
-            { phase => 'in_transaction', on_error => 'warn' });
+    _setup_cdc(capture_old => 1);
+    $CDC->on('App::Schema', '*' => sub { die "Intentional failure" },
+        { phase => 'in_transaction', on_error => 'warn' });
 
     my $warned = 0;
     local $SIG{__WARN__} = sub { $warned++ if $_[0] =~ /Intentional/ };
@@ -694,20 +698,16 @@ subtest 'Error policy: warn – DML succeeds and commits' => sub {
     is($CDC->count_events('App::Schema', table => 'departments', operation => 'INSERT'),
         1, 'CDC event also committed');
 
-    # Restore
-    $CDC->setup('App::Schema', tables => 'all')
-        ->log_to_dbi('App::Schema', 'cdc_events')
-        ->on('App::Schema', '*' => sub { push @callback_events, $_[0] });
+    _setup_cdc(capture_old => 1);
 };
 
 subtest 'Error policy: abort – DML rolls back' => sub {
     plan tests => 2;
     clean_tables();
 
-    $CDC->setup('App::Schema', tables => 'all')
-        ->log_to_dbi('App::Schema', 'cdc_events')
-        ->on('App::Schema', '*' => sub { die "Abort!" },
-            { phase => 'in_transaction', on_error => 'abort' });
+    _setup_cdc(capture_old => 1);
+    $CDC->on('App::Schema', '*' => sub { die "Abort!" },
+        { phase => 'in_transaction', on_error => 'abort' });
 
     my $died = 0;
     try {
@@ -718,19 +718,15 @@ subtest 'Error policy: abort – DML rolls back' => sub {
     my ($n) = $dbh->selectrow_array("SELECT COUNT(*) FROM departments WHERE name='Abort'");
     is($n, 0, 'Row not committed');
 
-    # Restore
-    $CDC->setup('App::Schema', tables => 'all')
-        ->log_to_dbi('App::Schema', 'cdc_events')
-        ->on('App::Schema', '*' => sub { push @callback_events, $_[0] });
+    _setup_cdc(capture_old => 1);
 };
 
 subtest 'log_to_stderr – structured log output' => sub {
     plan tests => 2;
     clean_tables();
 
-    $CDC->setup('App::Schema', tables => 'all')
-        ->log_to_dbi('App::Schema', 'cdc_events')
-        ->log_to_stderr('App::Schema', 'TEST_CDC');
+    _setup_cdc(capture_old => 1);
+    $CDC->log_to_stderr('App::Schema', 'TEST_CDC');
 
     my $log_output = '';
     local $SIG{__WARN__} = sub { $log_output .= $_[0] };
@@ -739,10 +735,48 @@ subtest 'log_to_stderr – structured log output' => sub {
     like($log_output, qr/\[TEST_CDC\]/, 'Log prefix present');
     like($log_output, qr/DEPARTMENTS.*INSERT/, 'Log contains table and operation');
 
-    # Restore
-    $CDC->setup('App::Schema', tables => 'all')
-        ->log_to_dbi('App::Schema', 'cdc_events')
-        ->on('App::Schema', '*' => sub { push @callback_events, $_[0] });
+    _setup_cdc(capture_old => 1);
+};
+
+subtest 'capture_old => 0 – no pre-fetch, no old_data' => sub {
+    plan tests => 6;
+    clean_tables();
+    _setup_cdc(capture_old => 0);
+
+    # INSERT — unchanged (never has old_data anyway)
+    App::Schema->table('Department')->insert({ name => 'Light', location => 'A' });
+    my $ins = $CDC->latest_event('App::Schema',
+        table => 'departments', operation => 'INSERT');
+    ok(defined $ins->{new_data}, 'INSERT: new_data present');
+
+    # Instance UPDATE — old_data should be undef, new_data has full row
+    my $dept = _fetch_dept({ name => 'Light' });
+    $CDC->clear_events('App::Schema');
+    $dept->update({ location => 'B' });
+    my $upd = $CDC->latest_event('App::Schema',
+        table => 'departments', operation => 'UPDATE');
+    ok(!defined $upd->{old_data}, 'UPDATE: old_data is undef');
+    ok(defined  $upd->{new_data}, 'UPDATE: new_data present');
+
+    # Class-method UPDATE — no pre-fetch, new_data has only changed cols
+    $CDC->clear_events('App::Schema');
+    App::Schema->table('Department')->update(
+        -set => { location => 'C' }, -where => { name => 'Light' });
+    my $cls = $CDC->latest_event('App::Schema',
+        table => 'departments', operation => 'UPDATE');
+    ok(!defined $cls->{old_data}, 'Class UPDATE: old_data is undef');
+    my $new = _parse($cls->{new_data});
+    ok(defined $new->{LOCATION}, 'Class UPDATE: new_data has changed col');
+
+    # Instance DELETE — old_data undef
+    $dept = _fetch_dept({ name => 'Light' });
+    $CDC->clear_events('App::Schema');
+    $dept->delete();
+    my $del = $CDC->latest_event('App::Schema',
+        table => 'departments', operation => 'DELETE');
+    ok(!defined $del->{old_data}, 'DELETE: old_data is undef');
+
+    _setup_cdc(capture_old => 1);
 };
 
 # ===============================================================
@@ -1104,6 +1138,57 @@ subtest 'Rapid successive operations on related tables' => sub {
     my @ops = map { $_->{operation} } @$all;
     is_deeply(\@ops, ['INSERT', 'UPDATE', 'DELETE'],
         'Department events in correct order');
+};
+
+subtest 'Performance ��� capture_old on vs off (class-method UPDATE)' => sub {
+    plan tests => 3;
+    my $N = $ENV{CDC_PERF_N} || 100;
+
+    # Setup rows (no CDC overhead)
+    clean_tables();
+    _with_cdc_disabled(sub {
+        for my $i (1..$N) {
+            App::Schema->table('Department')->insert({
+                name => "co_$i", location => 'before',
+            });
+        }
+    });
+
+    # --- capture_old => 1 (pre-fetch SELECT) ---
+    _setup_cdc(capture_old => 1);
+    $CDC->clear_events('App::Schema');
+    my $t0 = [gettimeofday];
+    App::Schema->table('Department')->update(
+        -set => { location => 'mid' }, -where => { location => 'before' });
+    my $full_elapsed = tv_interval($t0);
+    my $full_rate = $N / ($full_elapsed || 0.001);
+
+    # --- capture_old => 0 (no pre-fetch) ---
+    _setup_cdc(capture_old => 0);
+    $CDC->clear_events('App::Schema');
+    $t0 = [gettimeofday];
+    App::Schema->table('Department')->update(
+        -set => { location => 'after' }, -where => { location => 'mid' });
+    my $light_elapsed = tv_interval($t0);
+    my $light_rate = $N / ($light_elapsed || 0.001);
+
+    my $speedup = $full_elapsed > 0
+        ? (($full_elapsed - $light_elapsed) / $full_elapsed) * 100
+        : 0;
+
+    diag sprintf "Class-method UPDATE (N=%d):", $N;
+    diag sprintf "  capture_old=1: %6.1f ops/s (%.3fs) — with pre-fetch SELECT",
+        $full_rate, $full_elapsed;
+    diag sprintf "  capture_old=0: %6.1f ops/s (%.3fs) — no pre-fetch",
+        $light_rate, $light_elapsed;
+    diag sprintf "  Speedup:       %+.1f%%", $speedup;
+
+    ok($full_rate > 0,  sprintf "capture_old=1: %.0f ops/s", $full_rate);
+    ok($light_rate > 0, sprintf "capture_old=0: %.0f ops/s", $light_rate);
+    cmp_ok($light_elapsed, '<=', $full_elapsed + 0.01,
+        'capture_old=0 is not slower than capture_old=1');
+
+    _setup_cdc(capture_old => 1);
 };
 
 # ===============================================================

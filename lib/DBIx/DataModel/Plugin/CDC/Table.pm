@@ -58,6 +58,12 @@ sub _cdc_dispatch {
     DBIx::DataModel::Plugin::CDC->dispatch($schema_class, $schema, $event);
 }
 
+sub _cdc_capture_old {
+    my ($self) = @_;
+    return DBIx::DataModel::Plugin::CDC->capture_old(
+        $self->schema->metadm->class);
+}
+
 sub _cdc_in_transaction {
     my ($self) = @_;
     return $self->schema->{transaction_dbhs} ? 1 : 0;
@@ -131,27 +137,30 @@ sub update {
     return $self->next::method(@args) unless $tname;
 
     my $schema_class = $self->schema->metadm->class;
+    my $want_old     = $self->_cdc_capture_old;
     my $is_class_method = @args && !ref $args[0] && ($args[0] // '') =~ /^-/;
 
     if ($is_class_method) {
-        return $self->_cdc_class_update($schema_class, $tname, @args);
+        return $self->_cdc_class_update($schema_class, $tname, $want_old, @args);
     }
 
-    my $old = _cdc_snapshot(undef, $self);
+    # Instance method: $row->update({...})
+    my $old = $want_old ? _cdc_snapshot(undef, $self) : undef;
 
     return $self->_cdc_ensure_atomic(sub {
         my $result = $SUPER_UPDATE->($self, @args);
 
         my $to_set  = ref $args[0] eq 'HASH' ? $args[0] : {};
         my %changes = map { uc($_) => $to_set->{$_} } keys %$to_set;
-        my %new     = (%$old, %changes);
+        my $new = $old ? { %$old, %changes }
+                       : { _cdc_snapshot(undef, $self), %changes };
 
         $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
             schema_name => $schema_class,
             table_name  => $tname,
             operation   => 'UPDATE',
             old_data    => $old,
-            new_data    => \%new,
+            new_data    => $new,
         ));
 
         return $result;
@@ -159,27 +168,45 @@ sub update {
 }
 
 sub _cdc_class_update {
-    my ($self, $schema_class, $tname, @args) = @_;
+    my ($self, $schema_class, $tname, $want_old, @args) = @_;
     my %named   = @args;
     my $to_set  = $named{'-set'}   || {};
     my $where   = $named{'-where'} || {};
+    my %changes = map { uc($_) => $to_set->{$_} } keys %$to_set;
 
+    if ($want_old) {
+        # Full mode: pre-fetch rows for old_data + complete new_data
+        return $self->_cdc_ensure_atomic(sub {
+            my $rows = $self->select(-where => $where);
+            my @snapshots = map { _cdc_snapshot(undef, $_) } @$rows;
+
+            my $result = $SUPER_UPDATE->($self, @args);
+
+            for my $old (@snapshots) {
+                $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
+                    schema_name => $schema_class,
+                    table_name  => $tname,
+                    operation   => 'UPDATE',
+                    old_data    => $old,
+                    new_data    => { %$old, %changes },
+                ));
+            }
+
+            return $result;
+        });
+    }
+
+    # Light mode: no pre-fetch, single event with just the changed values
     return $self->_cdc_ensure_atomic(sub {
-        my $rows = $self->select(-where => $where);
-        my @snapshots = map { _cdc_snapshot(undef, $_) } @$rows;
-
         my $result = $SUPER_UPDATE->($self, @args);
 
-        my %changes = map { uc($_) => $to_set->{$_} } keys %$to_set;
-        for my $old (@snapshots) {
-            $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
-                schema_name => $schema_class,
-                table_name  => $tname,
-                operation   => 'UPDATE',
-                old_data    => $old,
-                new_data    => { %$old, %changes },
-            ));
-        }
+        $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
+            schema_name => $schema_class,
+            table_name  => $tname,
+            operation   => 'UPDATE',
+            old_data    => undef,
+            new_data    => \%changes,
+        ));
 
         return $result;
     });
@@ -196,13 +223,15 @@ sub delete {
     return $self->next::method(@args) unless $tname;
 
     my $schema_class = $self->schema->metadm->class;
+    my $want_old     = $self->_cdc_capture_old;
     my $is_class_method = @args && !ref $args[0] && ($args[0] // '') =~ /^-/;
 
     if ($is_class_method) {
-        return $self->_cdc_class_delete($schema_class, $tname, @args);
+        return $self->_cdc_class_delete($schema_class, $tname, $want_old, @args);
     }
 
-    my $old = _cdc_snapshot(undef, $self);
+    # Instance method: $row->delete()
+    my $old = $want_old ? _cdc_snapshot(undef, $self) : undef;
 
     return $self->_cdc_ensure_atomic(sub {
         my $result = $SUPER_DELETE->($self, @args);
@@ -220,25 +249,43 @@ sub delete {
 }
 
 sub _cdc_class_delete {
-    my ($self, $schema_class, $tname, @args) = @_;
+    my ($self, $schema_class, $tname, $want_old, @args) = @_;
     my %named = @args;
     my $where = $named{'-where'} || {};
 
-    return $self->_cdc_ensure_atomic(sub {
-        my $rows = $self->select(-where => $where);
-        my @snapshots = map { _cdc_snapshot(undef, $_) } @$rows;
+    if ($want_old) {
+        # Full mode: pre-fetch for old_data
+        return $self->_cdc_ensure_atomic(sub {
+            my $rows = $self->select(-where => $where);
+            my @snapshots = map { _cdc_snapshot(undef, $_) } @$rows;
 
+            my $result = $SUPER_DELETE->($self, @args);
+
+            for my $old (@snapshots) {
+                $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
+                    schema_name => $schema_class,
+                    table_name  => $tname,
+                    operation   => 'DELETE',
+                    old_data    => $old,
+                    new_data    => undef,
+                ));
+            }
+
+            return $result;
+        });
+    }
+
+    # Light mode: no pre-fetch, single event
+    return $self->_cdc_ensure_atomic(sub {
         my $result = $SUPER_DELETE->($self, @args);
 
-        for my $old (@snapshots) {
-            $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
-                schema_name => $schema_class,
-                table_name  => $tname,
-                operation   => 'DELETE',
-                old_data    => $old,
-                new_data    => undef,
-            ));
-        }
+        $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
+            schema_name => $schema_class,
+            table_name  => $tname,
+            operation   => 'DELETE',
+            old_data    => undef,
+            new_data    => undef,
+        ));
 
         return $result;
     });

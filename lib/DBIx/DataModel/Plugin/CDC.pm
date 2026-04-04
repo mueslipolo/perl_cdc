@@ -18,10 +18,13 @@ my %REGISTRY;
 # ---------------------------------------------------------------
 # setup($schema_class, %args)
 #
-#   tables => 'all' | \@table_names
+#   tables      => 'all' | \@table_names
+#   capture_old => 0 | 1    (default: 0)
 #
-# Registers a schema for CDC.  Call ->on() after this to add
-# listeners.  Returns the config object for chaining.
+# When capture_old is 0 (the default), UPDATE and DELETE events
+# have old_data and changed_columns set to undef.  Class-method
+# update/delete skip the pre-fetch SELECT (zero overhead).
+# Set to 1 if you need before/after comparison.
 # ---------------------------------------------------------------
 sub setup {
     my ($class, $schema_class, %args) = @_;
@@ -39,10 +42,11 @@ sub setup {
     }
 
     $REGISTRY{$schema_class} = {
-        tracked    => \%tracked,
-        listeners  => [],
-        dbi_table  => undef,    # set by log_to_dbi
-        _sth_cache => {},
+        tracked     => \%tracked,
+        capture_old => $args{capture_old} // 0,
+        listeners   => [],
+        dbi_table   => undef,
+        _sth_cache  => {},
     };
 
     return $class;
@@ -57,6 +61,12 @@ sub is_tracked {
     my ($class, $schema_class, $table_name) = @_;
     my $cfg = $REGISTRY{$schema_class} or return 0;
     return $cfg->{tracked}{$table_name} ? 1 : 0;
+}
+
+sub capture_old {
+    my ($class, $schema_class) = @_;
+    my $cfg = $REGISTRY{$schema_class} or return 1;
+    return $cfg->{capture_old};
 }
 
 # ---------------------------------------------------------------
