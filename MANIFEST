@@ -10,11 +10,6 @@ examples/oracle-cdc-poc/setup.sh
 examples/oracle-cdc-poc/t/01_cdc_end_to_end.t
 lib/DBIx/DataModel/Plugin/CDC.pm
 lib/DBIx/DataModel/Plugin/CDC/Event.pm
-lib/DBIx/DataModel/Plugin/CDC/Handler.pm
-lib/DBIx/DataModel/Plugin/CDC/Handler/Callback.pm
-lib/DBIx/DataModel/Plugin/CDC/Handler/DBI.pm
-lib/DBIx/DataModel/Plugin/CDC/Handler/Log.pm
-lib/DBIx/DataModel/Plugin/CDC/Handler/Multi.pm
 lib/DBIx/DataModel/Plugin/CDC/Table.pm
 LICENSE
 Makefile.PL

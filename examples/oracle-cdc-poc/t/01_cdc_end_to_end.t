@@ -32,12 +32,7 @@ use lib 'lib';
 use App::Schema;
 use DBIx::DataModel::Plugin::CDC;
 use DBIx::DataModel::Plugin::CDC::Event;
-use DBIx::DataModel::Plugin::CDC::Handler::DBI;
-use DBIx::DataModel::Plugin::CDC::Handler::Callback;
-use DBIx::DataModel::Plugin::CDC::Handler::Log;
-use DBIx::DataModel::Plugin::CDC::Handler::Multi;
 
-my $JSON_ENCODE = Cpanel::JSON::XS->new->utf8->canonical->allow_nonref;
 my $JSON_DECODE = Cpanel::JSON::XS->new->canonical->allow_nonref;
 
 # ---------------------------------------------------------------
@@ -63,19 +58,12 @@ App::Schema->dbh($dbh);
 # Callback event collector
 my @callback_events;
 
-my $dbi_handler = DBIx::DataModel::Plugin::CDC::Handler::DBI->new(
-    table_name => 'cdc_events',
-);
-my $cb_handler = DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-    on_event => sub { push @callback_events, $_[0] },
-    phase    => 'post_commit',
-    on_error => 'warn',
-);
-
-DBIx::DataModel::Plugin::CDC->setup('App::Schema',
-    tables   => 'all',
-    handlers => [$dbi_handler, $cb_handler],
-);
+DBIx::DataModel::Plugin::CDC
+    ->setup('App::Schema', tables => 'all')
+    ->log_to_dbi('App::Schema', 'cdc_events')
+    ->on('App::Schema', '*' => sub {
+        push @callback_events, $_[0];
+    });
 
 # ---------------------------------------------------------------
 # Helpers
@@ -660,89 +648,66 @@ subtest 'Event::build – changed_columns only for UPDATE' => sub {
     is_deeply($upd->{changed_columns}, ['B'], 'UPDATE: only B changed');
 };
 
-subtest 'Multi handler – DBI + Callback both fire' => sub {
+subtest 'Multiple listeners both fire' => sub {
     plan tests => 3;
     clean_tables();
 
-    my @multi_events;
-    my $multi = DBIx::DataModel::Plugin::CDC::Handler::Multi->new(
-        handlers => [
-            DBIx::DataModel::Plugin::CDC::Handler::DBI->new(table_name => 'cdc_events'),
-            DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-                on_event => sub { push @multi_events, $_[0] },
-                phase    => 'in_transaction',
-            ),
-        ],
-    );
-
-    # Temporarily replace handlers to test Multi
-    my $cfg = $CDC->config_for('App::Schema');
-    my $orig_handlers = $cfg->{handlers};
-    $cfg->{handlers} = [$multi];
+    # Reset and reconfigure with an extra in_transaction listener
+    my @extra_events;
+    $CDC->setup('App::Schema', tables => 'all')
+        ->log_to_dbi('App::Schema', 'cdc_events')
+        ->on('App::Schema', '*' => sub { push @callback_events, $_[0] })
+        ->on('App::Schema', 'INSERT' => sub { push @extra_events, $_[0] },
+            { phase => 'in_transaction' });
 
     App::Schema->table('Department')->insert({ name => 'Multi', location => 'X' });
 
     is($CDC->count_events('App::Schema', table => 'departments', operation => 'INSERT'),
-        1, 'DBI handler wrote event');
-    ok(@multi_events >= 1, 'Callback handler also fired');
-    is($multi_events[-1]{operation}, 'INSERT', 'Callback got INSERT');
+        1, 'DBI listener wrote event');
+    ok(@extra_events >= 1, 'Extra in_transaction listener fired');
+    is($extra_events[-1]{operation}, 'INSERT', 'Got INSERT');
 
-    # Restore
-    $cfg->{handlers} = $orig_handlers;
+    # Restore standard config
+    $CDC->setup('App::Schema', tables => 'all')
+        ->log_to_dbi('App::Schema', 'cdc_events')
+        ->on('App::Schema', '*' => sub { push @callback_events, $_[0] });
 };
 
-subtest 'Handler error policy: warn – DML succeeds and commits' => sub {
+subtest 'Error policy: warn – DML succeeds and commits' => sub {
     plan tests => 4;
     clean_tables();
 
-    my $failing_cb = DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-        on_event => sub { die "Intentional failure" },
-        phase    => 'in_transaction',
-        on_error => 'warn',
-    );
-    my $multi = DBIx::DataModel::Plugin::CDC::Handler::Multi->new(
-        handlers => [
-            $dbi_handler,
-            $failing_cb,
-        ],
-    );
-
-    my $cfg = $CDC->config_for('App::Schema');
-    my $orig = $cfg->{handlers};
-    $cfg->{handlers} = [$multi];
+    $CDC->setup('App::Schema', tables => 'all')
+        ->log_to_dbi('App::Schema', 'cdc_events')
+        ->on('App::Schema', '*' => sub { die "Intentional failure" },
+            { phase => 'in_transaction', on_error => 'warn' });
 
     my $warned = 0;
     local $SIG{__WARN__} = sub { $warned++ if $_[0] =~ /Intentional/ };
     lives_ok {
         App::Schema->table('Department')->insert({ name => 'Warn', location => 'X' });
-    } 'DML succeeds despite handler failure';
+    } 'DML succeeds despite listener failure';
     ok($warned, 'Warning was emitted');
 
-    # Verify DML actually committed
     my ($n) = $dbh->selectrow_array("SELECT COUNT(*) FROM departments WHERE name='Warn'");
     is($n, 1, 'Row committed to database');
     is($CDC->count_events('App::Schema', table => 'departments', operation => 'INSERT'),
         1, 'CDC event also committed');
 
-    $cfg->{handlers} = $orig;
+    # Restore
+    $CDC->setup('App::Schema', tables => 'all')
+        ->log_to_dbi('App::Schema', 'cdc_events')
+        ->on('App::Schema', '*' => sub { push @callback_events, $_[0] });
 };
 
-subtest 'Handler error policy: abort – DML rolls back' => sub {
+subtest 'Error policy: abort – DML rolls back' => sub {
     plan tests => 2;
     clean_tables();
 
-    my $failing_cb = DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-        on_event => sub { die "Abort!" },
-        phase    => 'in_transaction',
-        on_error => 'abort',
-    );
-    my $multi = DBIx::DataModel::Plugin::CDC::Handler::Multi->new(
-        handlers => [$dbi_handler, $failing_cb],
-    );
-
-    my $cfg = $CDC->config_for('App::Schema');
-    my $orig = $cfg->{handlers};
-    $cfg->{handlers} = [$multi];
+    $CDC->setup('App::Schema', tables => 'all')
+        ->log_to_dbi('App::Schema', 'cdc_events')
+        ->on('App::Schema', '*' => sub { die "Abort!" },
+            { phase => 'in_transaction', on_error => 'abort' });
 
     my $died = 0;
     try {
@@ -753,21 +718,19 @@ subtest 'Handler error policy: abort – DML rolls back' => sub {
     my ($n) = $dbh->selectrow_array("SELECT COUNT(*) FROM departments WHERE name='Abort'");
     is($n, 0, 'Row not committed');
 
-    $cfg->{handlers} = $orig;
+    # Restore
+    $CDC->setup('App::Schema', tables => 'all')
+        ->log_to_dbi('App::Schema', 'cdc_events')
+        ->on('App::Schema', '*' => sub { push @callback_events, $_[0] });
 };
 
-subtest 'Handler::Log – outputs structured log' => sub {
-    plan tests => 3;
+subtest 'log_to_stderr – structured log output' => sub {
+    plan tests => 2;
     clean_tables();
 
-    my $log_handler = DBIx::DataModel::Plugin::CDC::Handler::Log->new(
-        prefix => 'TEST_CDC',
-    );
-    is($log_handler->phase, 'post_commit', 'Log handler phase is post_commit');
-
-    my $cfg = $CDC->config_for('App::Schema');
-    my $orig = $cfg->{handlers};
-    $cfg->{handlers} = [$dbi_handler, $log_handler];
+    $CDC->setup('App::Schema', tables => 'all')
+        ->log_to_dbi('App::Schema', 'cdc_events')
+        ->log_to_stderr('App::Schema', 'TEST_CDC');
 
     my $log_output = '';
     local $SIG{__WARN__} = sub { $log_output .= $_[0] };
@@ -776,7 +739,10 @@ subtest 'Handler::Log – outputs structured log' => sub {
     like($log_output, qr/\[TEST_CDC\]/, 'Log prefix present');
     like($log_output, qr/DEPARTMENTS.*INSERT/, 'Log contains table and operation');
 
-    $cfg->{handlers} = $orig;
+    # Restore
+    $CDC->setup('App::Schema', tables => 'all')
+        ->log_to_dbi('App::Schema', 'cdc_events')
+        ->on('App::Schema', '*' => sub { push @callback_events, $_[0] });
 };
 
 # ===============================================================

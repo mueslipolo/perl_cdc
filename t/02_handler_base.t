@@ -4,83 +4,94 @@ use warnings;
 use Test::More;
 use Test::Exception;
 
-use DBIx::DataModel::Plugin::CDC::Handler;
+use DBIx::DataModel;
+use DBIx::DataModel::Plugin::CDC;
+use DBIx::DataModel::Plugin::CDC::Table;
 
-subtest 'abstract methods enforced' => sub {
-    plan tests => 2;
-    my $h = DBIx::DataModel::Plugin::CDC::Handler->new();
-    throws_ok { $h->dispatch_event({}, undef) }
-        qr/should implement.*dispatch_event/i, 'dispatch_event is abstract';
-    throws_ok { $h->phase() }
-        qr/should implement.*phase/i, 'phase is abstract';
-};
+# Test schema (no DB needed)
+DBIx::DataModel->Schema('Test::On::Schema',
+    table_parent => 'DBIx::DataModel::Plugin::CDC::Table',
+);
+Test::On::Schema->Table(Widget => 'widgets', 'id');
 
-subtest 'DBI handler – constructor validation' => sub {
-    plan tests => 2;
-    use DBIx::DataModel::Plugin::CDC::Handler::DBI;
+my $CDC = 'DBIx::DataModel::Plugin::CDC';
 
-    lives_ok {
-        DBIx::DataModel::Plugin::CDC::Handler::DBI->new(table_name => 'cdc_events');
-    } 'valid table_name accepted';
+subtest 'on() – validation' => sub {
+    plan tests => 5;
+    $CDC->setup('Test::On::Schema', tables => 'all');
+
+    throws_ok { $CDC->on() }
+        qr/schema class/, 'missing schema croaks';
+
+    throws_ok { $CDC->on('Test::On::Schema') }
+        qr/operation/, 'missing operation croaks';
+
+    throws_ok { $CDC->on('Test::On::Schema', 'insert') }
+        qr/coderef/, 'missing coderef croaks';
 
     throws_ok {
-        DBIx::DataModel::Plugin::CDC::Handler::DBI->new(table_name => 'DROP TABLE x; --');
-    } qr/did not pass/, 'SQL injection in table_name rejected';
+        $CDC->on('Test::On::Schema', 'insert', sub {}, { phase => 'bogus' });
+    } qr/invalid phase/, 'invalid phase croaks';
+
+    throws_ok {
+        $CDC->on('Test::On::Schema', 'insert', sub {}, { on_error => 'explode' });
+    } qr/invalid on_error/, 'invalid on_error croaks';
 };
 
-subtest 'Callback handler – constructor validation' => sub {
+subtest 'on() – accepts valid params' => sub {
     plan tests => 3;
-    use DBIx::DataModel::Plugin::CDC::Handler::Callback;
+    $CDC->setup('Test::On::Schema', tables => 'all');
 
     lives_ok {
-        DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-            on_event => sub { 1 }, phase => 'post_commit', on_error => 'warn',
-        );
-    } 'valid params accepted';
+        $CDC->on('Test::On::Schema', 'insert', sub { 1 });
+    } 'simple callback';
 
-    throws_ok {
-        DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-            on_event => 'not a coderef',
-        );
-    } qr/type/, 'non-coderef on_event rejected';
-
-    throws_ok {
-        DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-            on_event => sub { 1 }, phase => 'invalid',
-        );
-    } qr/did not pass/, 'invalid phase rejected';
-};
-
-subtest 'Log handler – defaults' => sub {
-    plan tests => 2;
-    use DBIx::DataModel::Plugin::CDC::Handler::Log;
-
-    my $h = DBIx::DataModel::Plugin::CDC::Handler::Log->new();
-    is($h->phase, 'post_commit', 'default phase');
-
-    my $h2 = DBIx::DataModel::Plugin::CDC::Handler::Log->new(prefix => 'AUDIT');
-    my $output = '';
-    local $SIG{__WARN__} = sub { $output .= $_[0] };
-    $h2->dispatch_event({
-        table_name => 'USERS', operation => 'INSERT', event_id => 'test-id',
-    }, undef);
-    like($output, qr/\[AUDIT\] USERS INSERT test-id/, 'custom prefix works');
-};
-
-subtest 'Multi handler – constructor validation' => sub {
-    plan tests => 2;
-    use DBIx::DataModel::Plugin::CDC::Handler::Multi;
-
-    throws_ok {
-        DBIx::DataModel::Plugin::CDC::Handler::Multi->new(handlers => []);
-    } qr/at least one/, 'empty handlers rejected';
-
-    my $cb = DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-        on_event => sub { 1 }, phase => 'in_transaction',
-    );
     lives_ok {
-        DBIx::DataModel::Plugin::CDC::Handler::Multi->new(handlers => [$cb]);
-    } 'valid handlers accepted';
+        $CDC->on('Test::On::Schema', '*', sub { 1 },
+            { phase => 'in_transaction', on_error => 'abort' });
+    } 'wildcard with all options';
+
+    lives_ok {
+        $CDC->on('Test::On::Schema', 'DELETE', sub { 1 });
+    } 'uppercase operation accepted';
+};
+
+subtest 'on() before setup() – croaks' => sub {
+    plan tests => 1;
+    throws_ok {
+        $CDC->on('No::Such::Schema', 'insert', sub { 1 });
+    } qr/not configured/, 'on() before setup() croaks';
+};
+
+subtest 'log_to_dbi – validation' => sub {
+    plan tests => 2;
+    $CDC->setup('Test::On::Schema', tables => 'all');
+
+    lives_ok {
+        $CDC->log_to_dbi('Test::On::Schema', 'cdc_events');
+    } 'valid table name';
+
+    throws_ok {
+        $CDC->log_to_dbi('Test::On::Schema', 'DROP TABLE x;--');
+    } qr/Invalid table name/, 'SQL injection rejected';
+};
+
+subtest 'log_to_stderr – registers listener' => sub {
+    plan tests => 1;
+    $CDC->setup('Test::On::Schema', tables => 'all');
+    lives_ok {
+        $CDC->log_to_stderr('Test::On::Schema', 'TEST');
+    } 'registers without error';
+};
+
+subtest 'chaining – setup -> log_to_dbi -> on' => sub {
+    plan tests => 1;
+    lives_ok {
+        $CDC->setup('Test::On::Schema', tables => 'all')
+            ->log_to_dbi('Test::On::Schema')
+            ->log_to_stderr('Test::On::Schema')
+            ->on('Test::On::Schema', '*', sub { 1 });
+    } 'full chain works';
 };
 
 done_testing();

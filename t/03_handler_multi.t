@@ -4,126 +4,120 @@ use warnings;
 use Test::More;
 use Test::Exception;
 
-use DBIx::DataModel::Plugin::CDC::Handler::Callback;
-use DBIx::DataModel::Plugin::CDC::Handler::Multi;
+use DBIx::DataModel;
+use DBIx::DataModel::Plugin::CDC;
+use DBIx::DataModel::Plugin::CDC::Table;
+use DBIx::DataModel::Plugin::CDC::Event;
 
-my $event = {
-    event_id   => 'test',
-    table_name => 'T',
-    operation  => 'INSERT',
-    old_data   => undef,
-    new_data   => { ID => 1 },
-};
+my $CDC = 'DBIx::DataModel::Plugin::CDC';
 
-subtest 'dispatches to in_transaction handlers' => sub {
+# Test schema
+DBIx::DataModel->Schema('Test::Dispatch::Schema',
+    table_parent => 'DBIx::DataModel::Plugin::CDC::Table',
+);
+Test::Dispatch::Schema->Table(Item => 'items', 'id');
+
+my $event = DBIx::DataModel::Plugin::CDC::Event->build(
+    schema_name => 'Test::Dispatch::Schema',
+    table_name  => 'ITEMS',
+    operation   => 'INSERT',
+    old_data    => undef,
+    new_data    => { ID => 1 },
+);
+
+# Mock schema object (no real DB)
+my $mock_schema = bless {}, 'Test::Dispatch::Schema';
+
+subtest 'dispatch – operation filtering' => sub {
     plan tests => 2;
+    $CDC->setup('Test::Dispatch::Schema', tables => 'all');
+
     my @seen;
-    my $multi = DBIx::DataModel::Plugin::CDC::Handler::Multi->new(
-        handlers => [
-            DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-                on_event => sub { push @seen, 'h1' },
-                phase    => 'in_transaction',
-            ),
-            DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-                on_event => sub { push @seen, 'h2' },
-                phase    => 'in_transaction',
-            ),
-        ],
-    );
-    $multi->dispatch_event($event, undef);
-    is(scalar @seen, 2, 'both handlers called');
-    is_deeply(\@seen, ['h1', 'h2'], 'in registration order');
+    $CDC->on('Test::Dispatch::Schema', 'INSERT', sub { push @seen, 'ins' },
+        { phase => 'in_transaction' });
+    $CDC->on('Test::Dispatch::Schema', 'UPDATE', sub { push @seen, 'upd' },
+        { phase => 'in_transaction' });
+
+    $CDC->dispatch('Test::Dispatch::Schema', $mock_schema, $event);
+    is(scalar @seen, 1, 'Only INSERT listener fired');
+    is($seen[0], 'ins', 'Correct listener');
 };
 
-subtest 'separates in_transaction and post_commit' => sub {
-    plan tests => 2;
-    my @in_txn;
-    my @post;
-    my $multi = DBIx::DataModel::Plugin::CDC::Handler::Multi->new(
-        handlers => [
-            DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-                on_event => sub { push @in_txn, 1 },
-                phase    => 'in_transaction',
-            ),
-            DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-                on_event => sub { push @post, 1 },
-                phase    => 'post_commit',
-            ),
-        ],
-    );
+subtest 'dispatch – wildcard matches all' => sub {
+    plan tests => 1;
+    $CDC->setup('Test::Dispatch::Schema', tables => 'all');
 
-    $multi->dispatch_event($event, undef);
-    is(scalar @in_txn, 1, 'in_transaction handler called');
+    my $called = 0;
+    $CDC->on('Test::Dispatch::Schema', '*', sub { $called++ },
+        { phase => 'in_transaction' });
 
-    $multi->dispatch_post_commit($event, undef);
-    is(scalar @post, 1, 'post_commit handler called');
+    $CDC->dispatch('Test::Dispatch::Schema', $mock_schema, $event);
+    ok($called, 'Wildcard listener fired');
 };
 
-subtest 'has_post_commit_handlers' => sub {
-    plan tests => 2;
-    my $no_post = DBIx::DataModel::Plugin::CDC::Handler::Multi->new(
-        handlers => [
-            DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-                on_event => sub { 1 }, phase => 'in_transaction',
-            ),
-        ],
-    );
-    ok(!$no_post->has_post_commit_handlers, 'no post_commit handlers');
+subtest 'dispatch – multiple listeners in order' => sub {
+    plan tests => 1;
+    $CDC->setup('Test::Dispatch::Schema', tables => 'all');
 
-    my $with_post = DBIx::DataModel::Plugin::CDC::Handler::Multi->new(
-        handlers => [
-            DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-                on_event => sub { 1 }, phase => 'post_commit',
-            ),
-        ],
-    );
-    ok($with_post->has_post_commit_handlers, 'has post_commit handlers');
+    my @order;
+    $CDC->on('Test::Dispatch::Schema', '*', sub { push @order, 'first' },
+        { phase => 'in_transaction' });
+    $CDC->on('Test::Dispatch::Schema', '*', sub { push @order, 'second' },
+        { phase => 'in_transaction' });
+
+    $CDC->dispatch('Test::Dispatch::Schema', $mock_schema, $event);
+    is_deeply(\@order, ['first', 'second'], 'Registration order preserved');
 };
 
 subtest 'error policy: warn' => sub {
     plan tests => 2;
-    my $multi = DBIx::DataModel::Plugin::CDC::Handler::Multi->new(
-        handlers => [
-            DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-                on_event => sub { die "boom" },
-                phase    => 'in_transaction',
-                on_error => 'warn',
-            ),
-        ],
-    );
+    $CDC->setup('Test::Dispatch::Schema', tables => 'all');
+
+    $CDC->on('Test::Dispatch::Schema', '*', sub { die "boom" },
+        { phase => 'in_transaction', on_error => 'warn' });
+
     my $warned = 0;
     local $SIG{__WARN__} = sub { $warned++ if $_[0] =~ /boom/ };
-    lives_ok { $multi->dispatch_event($event, undef) } 'warn policy does not die';
-    ok($warned, 'warning was emitted');
+    lives_ok { $CDC->dispatch('Test::Dispatch::Schema', $mock_schema, $event) }
+        'warn policy does not die';
+    ok($warned, 'warning emitted');
 };
 
 subtest 'error policy: abort' => sub {
     plan tests => 1;
-    my $multi = DBIx::DataModel::Plugin::CDC::Handler::Multi->new(
-        handlers => [
-            DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-                on_event => sub { die "critical" },
-                phase    => 'in_transaction',
-                on_error => 'abort',
-            ),
-        ],
-    );
-    throws_ok { $multi->dispatch_event($event, undef) }
-        qr/critical/, 'abort policy propagates exception';
+    $CDC->setup('Test::Dispatch::Schema', tables => 'all');
+
+    $CDC->on('Test::Dispatch::Schema', '*', sub { die "critical" },
+        { phase => 'in_transaction', on_error => 'abort' });
+
+    throws_ok { $CDC->dispatch('Test::Dispatch::Schema', $mock_schema, $event) }
+        qr/critical/, 'abort policy propagates';
 };
 
 subtest 'error policy: ignore' => sub {
     plan tests => 1;
-    my $multi = DBIx::DataModel::Plugin::CDC::Handler::Multi->new(
-        handlers => [
-            DBIx::DataModel::Plugin::CDC::Handler::Callback->new(
-                on_event => sub { die "silent" },
-                phase    => 'in_transaction',
-                on_error => 'ignore',
-            ),
-        ],
-    );
-    lives_ok { $multi->dispatch_event($event, undef) } 'ignore policy swallows';
+    $CDC->setup('Test::Dispatch::Schema', tables => 'all');
+
+    $CDC->on('Test::Dispatch::Schema', '*', sub { die "silent" },
+        { phase => 'in_transaction', on_error => 'ignore' });
+
+    lives_ok { $CDC->dispatch('Test::Dispatch::Schema', $mock_schema, $event) }
+        'ignore policy swallows';
+};
+
+subtest 'abort does not prevent subsequent listeners from cleanup' => sub {
+    plan tests => 2;
+    $CDC->setup('Test::Dispatch::Schema', tables => 'all');
+
+    my $first_ran = 0;
+    $CDC->on('Test::Dispatch::Schema', '*', sub { $first_ran = 1 },
+        { phase => 'in_transaction' });
+    $CDC->on('Test::Dispatch::Schema', '*', sub { die "abort" },
+        { phase => 'in_transaction', on_error => 'abort' });
+
+    throws_ok { $CDC->dispatch('Test::Dispatch::Schema', $mock_schema, $event) }
+        qr/abort/, 'abort propagated';
+    ok($first_ran, 'First listener ran before abort');
 };
 
 done_testing();
