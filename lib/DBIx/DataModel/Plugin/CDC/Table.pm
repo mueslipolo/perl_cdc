@@ -30,12 +30,23 @@ sub _cdc_table_name {
 
 # ---------------------------------------------------------------
 # _cdc_snapshot($obj) -> \%hash
+#
+# Captures all column values, including inflated refs (multivalue
+# fields, JSON columns, etc).  Skips only DBIx::DataModel internals
+# (__schema, __schema_class) and Composition component keys.
 # ---------------------------------------------------------------
 sub _cdc_snapshot {
     my ($class_or_self, $obj) = @_;
+
+    # Build skip-set: internal keys + composition component role names
+    my %skip;
+    if (my $metadm = eval { $obj->metadm }) {
+        $skip{$_} = 1 for $metadm->components;
+    }
+
     return {
         map  { uc($_) => $obj->{$_} }
-        grep { !/^__/ && !ref($obj->{$_}) }
+        grep { !/^__/ && !$skip{$_} }
         keys %$obj
     };
 }

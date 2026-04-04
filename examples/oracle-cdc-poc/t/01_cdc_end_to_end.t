@@ -1055,18 +1055,17 @@ subtest 'Cross-table transaction – rollback undoes all events' => sub {
         'Employee events rolled back');
 };
 
-subtest 'Snapshot excludes non-scalar fields (subtree refs)' => sub {
+subtest 'Snapshot captures all columns, skips components' => sub {
     plan tests => 2;
     clean_tables();
     @callback_events = ();
     App::Schema->table('Department')->insert({ name => 'SnapTest', location => 'Y' });
 
-    # The callback gets the raw event — verify no arrayref in new_data
     my @ins = grep { $_->{operation} eq 'INSERT' } @callback_events;
     my $new = $ins[-1]{new_data};
     ok(defined $new->{NAME}, 'NAME present in snapshot');
-    my @refs = grep { ref $new->{$_} } keys %$new;
-    is(scalar @refs, 0, 'No reference values in snapshot (arrayrefs filtered)');
+    # Verify no composition component keys leaked (e.g., 'EMPLOYEES')
+    ok(!exists $new->{EMPLOYEES}, 'Component role name not in snapshot');
 };
 
 subtest 'Rapid successive operations on related tables' => sub {
