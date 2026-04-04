@@ -2,7 +2,6 @@
 requires 'DBIx::DataModel',  '>= 3.0';
 requires 'DBI',              '>= 1.643';
 requires 'Cpanel::JSON::XS', '>= 4.0';
-requires 'Params::Validate', '>= 1.30';
 requires 'Try::Tiny',        '>= 0.30';
 requires 'Scalar::Util';
 requires 'Time::HiRes';

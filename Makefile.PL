@@ -14,7 +14,6 @@ WriteMakefile(
         'DBIx::DataModel'  => '3.0',
         'DBI'              => '1.643',
         'Cpanel::JSON::XS' => '4.0',
-        'Params::Validate' => '1.30',
         'Try::Tiny'        => '0.30',
         'Scalar::Util'     => '0',
         'Time::HiRes'      => '0',

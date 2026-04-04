@@ -4,13 +4,17 @@ use strict;
 use warnings;
 use parent 'DBIx::DataModel::Source::Table';
 
-use Scalar::Util qw(blessed);
 use Try::Tiny;
 use DBIx::DataModel::Plugin::CDC;
 use DBIx::DataModel::Plugin::CDC::Event;
 use namespace::clean;
 
-our $VERSION = '1.01';
+our $VERSION = '2.00';
+
+# Resolve parent methods once at compile time.
+my $SUPER_INSERT = __PACKAGE__->can('DBIx::DataModel::Source::Table::insert');
+my $SUPER_UPDATE = __PACKAGE__->can('DBIx::DataModel::Source::Table::update');
+my $SUPER_DELETE = __PACKAGE__->can('DBIx::DataModel::Source::Table::delete');
 
 # ---------------------------------------------------------------
 # _cdc_table_name() -> $name | undef
@@ -36,9 +40,6 @@ sub _cdc_snapshot {
     };
 }
 
-# ---------------------------------------------------------------
-# _cdc_dispatch($event)
-# ---------------------------------------------------------------
 sub _cdc_dispatch {
     my ($self, $event) = @_;
     my $schema       = $self->schema;
@@ -46,9 +47,6 @@ sub _cdc_dispatch {
     DBIx::DataModel::Plugin::CDC->dispatch($schema_class, $schema, $event);
 }
 
-# ---------------------------------------------------------------
-# _cdc_in_transaction() -> bool
-# ---------------------------------------------------------------
 sub _cdc_in_transaction {
     my ($self) = @_;
     return $self->schema->{transaction_dbhs} ? 1 : 0;
@@ -56,9 +54,6 @@ sub _cdc_in_transaction {
 
 # ---------------------------------------------------------------
 # _cdc_ensure_atomic($coderef)
-#
-# If already in a transaction, just run the code.
-# Otherwise, lightweight mini-transaction for atomicity.
 # ---------------------------------------------------------------
 sub _cdc_ensure_atomic {
     my ($self, $code) = @_;
@@ -84,17 +79,7 @@ sub _cdc_ensure_atomic {
 }
 
 # ---------------------------------------------------------------
-# _cdc_resolve_super($method) -> \&coderef
-# ---------------------------------------------------------------
-sub _cdc_resolve_super {
-    my ($self, $method) = @_;
-    my $super = $self->can("DBIx::DataModel::Source::Table::$method")
-        or die "CDC: cannot resolve parent method Source::Table::$method";
-    return $super;
-}
-
-# ---------------------------------------------------------------
-# insert — override
+# insert
 # ---------------------------------------------------------------
 sub insert {
     my $self = shift;
@@ -104,20 +89,18 @@ sub insert {
     return $self->next::method(@args) unless $tname;
 
     my $schema_class = $self->schema->metadm->class;
-    my $super = $self->_cdc_resolve_super('insert');
 
     return $self->_cdc_ensure_atomic(sub {
-        my @results = $super->($self, @args);
+        my @results = $SUPER_INSERT->($self, @args);
 
         for my $rec (@args) {
             next unless ref $rec;
-            my $new_data = _cdc_snapshot(undef, $rec);
             my $event = DBIx::DataModel::Plugin::CDC::Event->build(
                 schema_name => $schema_class,
                 table_name  => $tname,
                 operation   => 'INSERT',
                 old_data    => undef,
-                new_data    => $new_data,
+                new_data    => _cdc_snapshot(undef, $rec),
             );
             $self->_cdc_dispatch($event);
         }
@@ -127,7 +110,7 @@ sub insert {
 }
 
 # ---------------------------------------------------------------
-# update — override
+# update
 # ---------------------------------------------------------------
 sub update {
     my $self = shift;
@@ -137,61 +120,54 @@ sub update {
     return $self->next::method(@args) unless $tname;
 
     my $schema_class = $self->schema->metadm->class;
-    my $super = $self->_cdc_resolve_super('update');
     my $is_class_method = @args && !ref $args[0] && ($args[0] // '') =~ /^-/;
 
     if ($is_class_method) {
-        return $self->_cdc_class_update($super, $schema_class, $tname, @args);
+        return $self->_cdc_class_update($schema_class, $tname, @args);
     }
 
-    # Instance method: $row->update({...})
     my $old = _cdc_snapshot(undef, $self);
 
     return $self->_cdc_ensure_atomic(sub {
-        my $result = $super->($self, @args);
+        my $result = $SUPER_UPDATE->($self, @args);
 
         my $to_set  = ref $args[0] eq 'HASH' ? $args[0] : {};
         my %changes = map { uc($_) => $to_set->{$_} } keys %$to_set;
         my %new     = (%$old, %changes);
 
-        my $event = DBIx::DataModel::Plugin::CDC::Event->build(
+        $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
             schema_name => $schema_class,
             table_name  => $tname,
             operation   => 'UPDATE',
             old_data    => $old,
             new_data    => \%new,
-        );
-        $self->_cdc_dispatch($event);
+        ));
 
         return $result;
     });
 }
 
-# Class-method update: SELECT + UPDATE + CDC events all inside atomic block
 sub _cdc_class_update {
-    my ($self, $super, $schema_class, $tname, @args) = @_;
+    my ($self, $schema_class, $tname, @args) = @_;
     my %named   = @args;
     my $to_set  = $named{'-set'}   || {};
     my $where   = $named{'-where'} || {};
 
     return $self->_cdc_ensure_atomic(sub {
-        # Pre-fetch inside the transaction to avoid TOCTOU
         my $rows = $self->select(-where => $where);
         my @snapshots = map { _cdc_snapshot(undef, $_) } @$rows;
 
-        my $result = $super->($self, @args);
+        my $result = $SUPER_UPDATE->($self, @args);
 
         my %changes = map { uc($_) => $to_set->{$_} } keys %$to_set;
         for my $old (@snapshots) {
-            my %new = (%$old, %changes);
-            my $event = DBIx::DataModel::Plugin::CDC::Event->build(
+            $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
                 schema_name => $schema_class,
                 table_name  => $tname,
                 operation   => 'UPDATE',
                 old_data    => $old,
-                new_data    => \%new,
-            );
-            $self->_cdc_dispatch($event);
+                new_data    => { %$old, %changes },
+            ));
         }
 
         return $result;
@@ -199,7 +175,7 @@ sub _cdc_class_update {
 }
 
 # ---------------------------------------------------------------
-# delete — override
+# delete
 # ---------------------------------------------------------------
 sub delete {
     my $self = shift;
@@ -209,35 +185,31 @@ sub delete {
     return $self->next::method(@args) unless $tname;
 
     my $schema_class = $self->schema->metadm->class;
-    my $super = $self->_cdc_resolve_super('delete');
     my $is_class_method = @args && !ref $args[0] && ($args[0] // '') =~ /^-/;
 
     if ($is_class_method) {
-        return $self->_cdc_class_delete($super, $schema_class, $tname, @args);
+        return $self->_cdc_class_delete($schema_class, $tname, @args);
     }
 
-    # Instance method: $row->delete()
     my $old = _cdc_snapshot(undef, $self);
 
     return $self->_cdc_ensure_atomic(sub {
-        my $result = $super->($self, @args);
+        my $result = $SUPER_DELETE->($self, @args);
 
-        my $event = DBIx::DataModel::Plugin::CDC::Event->build(
+        $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
             schema_name => $schema_class,
             table_name  => $tname,
             operation   => 'DELETE',
             old_data    => $old,
             new_data    => undef,
-        );
-        $self->_cdc_dispatch($event);
+        ));
 
         return $result;
     });
 }
 
-# Class-method delete: SELECT + DELETE + CDC events all inside atomic block
 sub _cdc_class_delete {
-    my ($self, $super, $schema_class, $tname, @args) = @_;
+    my ($self, $schema_class, $tname, @args) = @_;
     my %named = @args;
     my $where = $named{'-where'} || {};
 
@@ -245,17 +217,16 @@ sub _cdc_class_delete {
         my $rows = $self->select(-where => $where);
         my @snapshots = map { _cdc_snapshot(undef, $_) } @$rows;
 
-        my $result = $super->($self, @args);
+        my $result = $SUPER_DELETE->($self, @args);
 
         for my $old (@snapshots) {
-            my $event = DBIx::DataModel::Plugin::CDC::Event->build(
+            $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
                 schema_name => $schema_class,
                 table_name  => $tname,
                 operation   => 'DELETE',
                 old_data    => $old,
                 new_data    => undef,
-            );
-            $self->_cdc_dispatch($event);
+            ));
         }
 
         return $result;
@@ -268,15 +239,12 @@ __END__
 
 =head1 NAME
 
-DBIx::DataModel::Plugin::CDC::Table — CDC-aware table parent class
+DBIx::DataModel::Plugin::CDC::Table - CDC-aware table parent class
 
 =head1 DESCRIPTION
 
 Use as C<table_parent> when declaring a DBIx::DataModel schema.
 Overrides C<insert>, C<update>, and C<delete> to capture change
-events and dispatch them to registered handlers.
-
-All CDC operations (snapshot, DML, event write) run inside the same
-database transaction for atomicity.
+events and dispatch them to registered listeners.
 
 =cut

@@ -2,11 +2,9 @@ package DBIx::DataModel::Plugin::CDC::Event;
 
 use strict;
 use warnings;
-use Carp qw(croak);
 use Time::HiRes ();
-use namespace::clean;
 
-our $VERSION = '1.01';
+our $VERSION = '2.00';
 
 my $_pid_hex = sprintf '%04x', $$ & 0xFFFF;
 my $_counter = 0;
@@ -14,15 +12,9 @@ my $_counter = 0;
 sub build {
     my ($class, %args) = @_;
 
-    croak 'Event::build requires table_name' unless defined $args{table_name};
-    croak 'Event::build requires operation'  unless defined $args{operation};
-    croak "Event::build: invalid operation '$args{operation}'"
-        unless $args{operation} =~ /\A(?:INSERT|UPDATE|DELETE)\z/;
-
     my $old = $args{old_data};
     my $new = $args{new_data};
 
-    # Compute changed columns for UPDATE
     my $changed;
     if ($args{operation} eq 'UPDATE' && $old && $new) {
         $changed = [

@@ -64,28 +64,4 @@ subtest 'build – unique IDs' => sub {
     is(scalar keys %ids, 1000, '1000 unique IDs generated');
 };
 
-subtest 'build – validation' => sub {
-    plan tests => 3;
-    throws_ok {
-        DBIx::DataModel::Plugin::CDC::Event->build(
-            schema_name => 'X', operation => 'INSERT',
-            old_data => undef, new_data => {},
-        );
-    } qr/table_name/, 'missing table_name croaks';
-
-    throws_ok {
-        DBIx::DataModel::Plugin::CDC::Event->build(
-            schema_name => 'X', table_name => 'T',
-            old_data => undef, new_data => {},
-        );
-    } qr/operation/, 'missing operation croaks';
-
-    throws_ok {
-        DBIx::DataModel::Plugin::CDC::Event->build(
-            schema_name => 'X', table_name => 'T', operation => 'MERGE',
-            old_data => undef, new_data => {},
-        );
-    } qr/invalid operation/, 'invalid operation croaks';
-};
-
 done_testing();
