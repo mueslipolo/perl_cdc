@@ -15,7 +15,7 @@ Requires only `podman` and `podman-compose`. Everything else runs in containers.
 
 - Departments + Employees schema with FK
 - CDC plugin captures all ORM operations to `cdc_events` table
-- 49 integration tests + performance benchmarks
+- 51 integration tests + performance benchmarks
 - Set `CDC_PERF_N=500` to adjust benchmark size
 
 ## Tear Down

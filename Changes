@@ -1,13 +1,19 @@
 Revision history for DBIx-DataModel-Plugin-CDC
 
+2.00  2026-04-04
+    - Event emitter API: ->on(), ->log_to_dbi(), ->log_to_stderr().
+      No handler classes — listeners are coderefs with metadata.
+    - capture_old option (default: off) for lightweight CDC.
+      Skips pre-fetch SELECT on class-method update/delete.
+    - row_id always present in event envelope — identifies which row
+      changed even when old_data is not captured.
+    - primary_key in event envelope — lists PK column names.
+    - Lightweight PK-only SELECT for class-method ops when capture_old=0.
+    - Three modules total: CDC.pm, Table.pm, Event.pm.
+
 1.01  2026-04-03
-    - Initial CPAN release.
+    - Initial implementation.
     - CDC::Table — table_parent class for insert/update/delete capture.
-    - CDC::Event — event envelope with time-based IDs, changed_columns diff.
-    - Handler::DBI — JSON persistence to database table (in_transaction).
-    - Handler::Callback — user coderef with configurable phase and error policy.
-    - Handler::Log — structured STDERR logging (post_commit).
-    - Handler::Multi — fan-out dispatcher with per-handler error isolation.
+    - CDC::Event — event envelope with time-based IDs, changed_columns.
     - Transaction safety: mini-transaction wrapping, TOCTOU protection.
-    - Follows DBIx::DataModel conventions: raw bless, Params::Validate,
-      namespace::clean, croak, define_abstract_methods.
+    - Follows DBIx::DataModel conventions: namespace::clean, croak.

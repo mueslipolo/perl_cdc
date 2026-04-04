@@ -42,10 +42,11 @@ App::Schema->Table(Employee   => 'employees',   'id');
 App::Schema->dbh($dbh);
 
 DBIx::DataModel::Plugin::CDC
-    ->setup('App::Schema', tables => 'all')
+    ->setup('App::Schema', tables => 'all')   # capture_old => 0 by default
     ->log_to_dbi('App::Schema', 'cdc_events')
     ->on('App::Schema', '*' => sub {
         my ($event, $schema) = @_;
+        # $event->{row_id} always identifies the row
         # push to Redis, webhook, etc.
     });
 
@@ -87,17 +88,17 @@ App::Schema->table('Department')->insert({ name => 'Engineering' });
 
 ### UPDATE and DELETE
 
-For **UPDATE**, the plugin snapshots the row's current state before the
-change, runs the update, then records both old and new data.  For
-`$row->update({salary => 80_000})`, the old salary and new salary are
-both captured.
+For **UPDATE**, the event contains `new_data` with the updated values and
+`row_id` identifying which row changed.  With `capture_old => 1`,
+`old_data` also contains the full row before the change.
 
-For **DELETE**, it snapshots the row before deletion.  The event contains
-`old_data` with the full row and `new_data => undef`.
+For **DELETE**, the event contains `row_id` and (with `capture_old => 1`)
+the full row in `old_data`.
 
 **Class-method operations** (`Table->update(-set => {...}, -where => {...})`)
-are handled by pre-fetching the affected rows inside the same transaction,
-running the DML, then generating one CDC event per affected row.
+fetch the affected PKs (lightweight `SELECT pk_cols` — not `SELECT *`),
+run the DML, then generate one CDC event per affected row.  With
+`capture_old => 1`, a full `SELECT *` is used instead.
 
 ### Multi-Table Operations
 
@@ -194,7 +195,10 @@ use DBIx::DataModel::Plugin::CDC;
 App::Schema->dbh($dbh);
 
 DBIx::DataModel::Plugin::CDC
-    ->setup('App::Schema', tables => 'all')    # or tables => ['Department']
+    ->setup('App::Schema',
+        tables      => 'all',           # or ['Department']
+        capture_old => 0,               # default; set 1 for before/after diff
+    )
 
     # Built-in: persist events as JSON to a DB table (in_transaction, abort on error)
     ->log_to_dbi('App::Schema', 'cdc_events')
@@ -270,25 +274,28 @@ Every listener receives an event hashref with this structure:
     occurred_at     => '2026-04-03T14:32:01Z',       # ISO 8601 UTC
     schema_name     => 'App::Schema',
     table_name      => 'EMPLOYEES',                   # always upper-case
+    primary_key     => ['ID'],                        # PK column names
+    row_id          => { ID => 42 },                  # actual PK values
     operation       => 'UPDATE',                      # INSERT | UPDATE | DELETE
 
-    old_data        => { ID => 42, SALARY => 75000, FIRST_NAME => 'Alice', ... },
-    new_data        => { ID => 42, SALARY => 80000, FIRST_NAME => 'Alice', ... },
-    changed_columns => ['SALARY'],                    # UPDATE only
+    old_data        => { ... },                       # only with capture_old => 1
+    new_data        => { SALARY => 80000, ... },      # changed or full row
+    changed_columns => ['SALARY'],                    # only with capture_old => 1
 }
 ```
 
-| Field | INSERT | UPDATE | DELETE |
-|---|---|---|---|
-| `old_data` | `undef` | hashref (before) | hashref (before) |
-| `new_data` | hashref (after) | hashref (after) | `undef` |
-| `changed_columns` | `undef` | arrayref | `undef` |
+| Field | Always? | Description |
+|---|---|---|
+| `event_id` | Yes | Time-based, monotonic within process |
+| `primary_key` | Yes | PK column names: `['ID']` or `['A', 'B']` |
+| `row_id` | Yes | PK values: `{ ID => 42 }` — identifies which row |
+| `operation` | Yes | `INSERT`, `UPDATE`, or `DELETE` |
+| `new_data` | INSERT, UPDATE | Full row (INSERT/instance) or changed cols (class-method) |
+| `old_data` | `capture_old => 1` only | Full row before change |
+| `changed_columns` | `capture_old => 1` only | Which columns differ between old and new |
 
-`log_to_dbi` serializes `old_data`/`new_data` to JSON.  Custom `->on()`
-listeners receive the raw Perl hashrefs.
-
-Event IDs are time-based and monotonically increasing within a process:
-`<seconds>-<microseconds>-<pid>-<counter>`.
+`log_to_dbi` serializes `old_data`/`new_data`/`row_id` to JSON.
+Custom `->on()` listeners receive raw Perl hashrefs.
 
 ---
 
@@ -366,11 +373,11 @@ No base class to inherit.  No interface to implement.  Just a sub.
 
 | ORM Path | Captured | Notes |
 |---|---|---|
-| `Table->insert({...})` | Yes | One event per record |
-| `$row->update({...})` | Yes | Snapshots old state from loaded row |
-| `$row->delete()` | Yes | Snapshots old state before deletion |
-| `Table->update(-set => {}, -where => {})` | Yes | Pre-fetches affected rows inside txn |
-| `Table->delete(-where => {})` | Yes | Pre-fetches affected rows inside txn |
+| `Table->insert({...})` | Yes | `row_id` + full `new_data` |
+| `$row->update({...})` | Yes | `row_id` + full `new_data` from `$self` |
+| `$row->delete()` | Yes | `row_id` always; `old_data` if `capture_old` |
+| `Table->update(-set, -where)` | Yes | PK-only SELECT (light) or full SELECT (`capture_old`) |
+| `Table->delete(-where)` | Yes | PK-only SELECT (light) or full SELECT (`capture_old`) |
 | Composition subtree insert | Yes | Child `insert()` is hooked |
 | Composition cascaded delete | Yes | Child `delete()` is hooked |
 | `$dbh->do(...)` / raw SQL | **No** | By design — only ORM operations |
@@ -423,7 +430,7 @@ DBIx-DataModel-Plugin-CDC/
 │       ├── docker-compose.yml
 │       ├── docker/
 │       ├── lib/App/
-│       └── t/01_cdc_end_to_end.t     # 49 integration tests + benchmarks
+│       └── t/01_cdc_end_to_end.t     # 51 integration tests + benchmarks
 ├── Makefile.PL
 ├── cpanfile
 ├── Changes
@@ -434,31 +441,32 @@ DBIx-DataModel-Plugin-CDC/
 
 ## Test Coverage
 
-**74 total tests**: 25 unit + 49 integration.
+**75 total tests**: 24 unit + 51 integration.
 
 ### Unit Tests (t/ — no database, runs on CPAN smoke)
 
 | File | Tests | Covers |
 |---|---|---|
-| `00_compile.t` | 3 | All 3 modules load cleanly |
-| `01_event.t` | 18 | Event::build, unique IDs (1000), ISO 8601 timestamps, changed_columns, validation |
-| `02_handler_base.t` | 16 | `on()` validation (phase, on_error, coderef), `log_to_dbi` SQL injection rejection, `log_to_stderr`, chaining |
-| `03_handler_multi.t` | 10 | Operation filtering, wildcard, listener ordering, abort/warn/ignore error policies, abort propagation |
-| `04_setup.t` | 7 | Registry with `tables => 'all'` and selective, `is_tracked`, validation |
+| `00_compile.t` | 3 | All 3 modules load |
+| `01_event.t` | 15 | Event::build, unique IDs (1000), ISO 8601, changed_columns |
+| `02_handler_base.t` | 16 | `on()` validation, `log_to_dbi` SQL injection, `log_to_stderr`, chaining |
+| `03_handler_multi.t` | 10 | Operation filtering, wildcard, listener ordering, abort/warn/ignore |
+| `04_setup.t` | 7 | Registry, selective tables, `is_tracked`, validation |
 
 ### Integration Tests (examples/oracle-cdc-poc/t/ — needs Oracle)
 
 | Section | Tests | Covers |
 |---|---|---|
-| CRUD | 5 | INSERT, UPDATE, DELETE with event content verification |
-| Transactions | 8 | ROLLBACK, COMMIT, AutoCommit atomicity, lifecycle, interleaved tables, constraint violations |
-| Class-method ops | 3 | Bulk UPDATE/DELETE per-row, no-match zero events |
-| Data integrity | 8 | NULL, unchanged columns, bulk, FK, UTF-8, empty string, update history, JSON round-trip |
-| Metadata & helpers | 5 | event_id, ordering, event_pairs, count filter, selective clear |
-| Plugin features | 10 | Callback envelope, changed_columns, multiple listeners, abort/warn policies, log_to_stderr |
-| Relationships | 5 | FK parent/child, cross-table rollback, snapshot filters refs, rapid multi-table ops |
-| Performance | 4 | INSERT/UPDATE/DELETE throughput (ORM vs ORM+CDC), batch in txn |
-| Trade-offs | 1 | Raw DBI bypass confirmation |
+| CRUD | 5 | INSERT, UPDATE, DELETE with event content |
+| Transactions | 8 | ROLLBACK, COMMIT, atomicity, lifecycle, interleaved, constraints |
+| Class-method ops | 3 | Bulk UPDATE/DELETE per-row, no-match |
+| Data integrity | 8 | NULL, unchanged columns, bulk, FK, UTF-8, empty string, history, JSON |
+| Metadata & helpers | 5 | event_id, ordering, event_pairs, count, selective clear |
+| Plugin features | 10 | Envelope (row_id, primary_key, changed_columns), listeners, abort/warn, log_to_stderr |
+| capture_old modes | 1 | capture_old=0: no old_data, row_id present, class-method no pre-fetch |
+| Performance | 5 | INSERT/UPDATE/DELETE ORM vs CDC, batch, capture_old=1 vs 0 |
+| Relationships | 5 | FK parent/child, cross-table rollback, snapshot filters, rapid ops |
+| Trade-offs | 1 | Raw DBI bypass |
 
 ---
 
@@ -505,7 +513,7 @@ declaration) are automatically excluded from snapshots via
 | Limitation | Notes |
 |---|---|
 | Raw SQL bypass | `$dbh->do(...)` is invisible to the plugin |
-| Pre-fetch overhead | Class-method `update`/`delete` runs a SELECT first |
+| Pre-fetch on class-method ops | PK-only SELECT with `capture_old=0`; full SELECT with `capture_old=1` |
 | Single-process IDs | Event IDs are unique per process; use the DB-generated `event_id` column for global ordering |
 | JSON in CLOB | Wide tables produce large JSON payloads in Oracle CLOB columns |
 | `changed_columns` on refs | Inflated values compared by refaddr, not deep equality — may report false positives |

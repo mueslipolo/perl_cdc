@@ -318,27 +318,61 @@ DBIx::DataModel::Plugin::CDC - Change Data Capture for DBIx::DataModel
 
     use DBIx::DataModel::Plugin::CDC;
 
-    # Configure
     DBIx::DataModel::Plugin::CDC
-        ->setup('App::Schema', tables => 'all')
+        ->setup('App::Schema',
+            tables      => 'all',
+            capture_old => 0,        # default; set 1 for before/after diff
+        )
         ->log_to_dbi('App::Schema', 'cdc_events')
-        ->log_to_stderr('App::Schema')
-        ->on('App::Schema', insert => sub {
-            my ($event, $schema) = @_;
-            # push to Redis, webhook, etc.
-        })
         ->on('App::Schema', '*' => sub {
-            my ($event) = @_;
-            # called for every operation
-        }, { phase => 'in_transaction', on_error => 'abort' });
+            my ($event, $schema) = @_;
+            # $event->{row_id}      — { ID => 42 } always present
+            # $event->{primary_key} — ['ID'] column names
+            # $event->{new_data}    — changed data (or full row for INSERT)
+            # $event->{old_data}    — undef unless capture_old => 1
+        });
 
 =head1 DESCRIPTION
 
-Captures INSERT, UPDATE, and DELETE events by wrapping
+Captures INSERT, UPDATE, and DELETE events by overriding
 L<DBIx::DataModel> table methods via C<table_parent>.
 
 Events are dispatched to listeners registered with C<on()>.
 Built-in shortcuts C<log_to_dbi()> and C<log_to_stderr()>
-cover the common cases without any handler classes.
+cover the common cases.
+
+=head2 setup($schema_class, %opts)
+
+    tables      => 'all' | \@names    # which tables to track
+    capture_old => 0 | 1              # capture old_data (default: 0)
+
+=head2 on($schema_class, $operation, \&callback, \%opts?)
+
+    $operation: 'INSERT', 'UPDATE', 'DELETE', or '*'
+    phase:      'in_transaction' | 'post_commit' (default)
+    on_error:   'abort' | 'warn' (default) | 'ignore'
+
+=head2 log_to_dbi($schema_class, $table_name?)
+
+Persist events as JSON.  Runs in_transaction, abort on error.
+
+=head2 log_to_stderr($schema_class, $prefix?)
+
+Print one-line log.  Runs post_commit.
+
+=head2 Event Envelope
+
+    {
+        event_id, occurred_at, schema_name, table_name,
+        primary_key => ['ID'],        # PK column names
+        row_id      => { ID => 42 },  # actual PK values
+        operation   => 'UPDATE',
+        old_data    => \%hash | undef,
+        new_data    => \%hash | undef,
+        changed_columns => [...] | undef,
+    }
+
+C<row_id> is always present.  C<old_data> and C<changed_columns>
+require C<capture_old =E<gt> 1>.
 
 =cut

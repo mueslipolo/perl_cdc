@@ -65,3 +65,19 @@ sub _generate_id {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+DBIx::DataModel::Plugin::CDC::Event - CDC event envelope builder
+
+=head1 DESCRIPTION
+
+Factory class.  C<build(%args)> returns a hashref with C<event_id>,
+C<occurred_at>, C<schema_name>, C<table_name>, C<primary_key>,
+C<row_id>, C<operation>, C<old_data>, C<new_data>, C<changed_columns>.
+
+Event IDs are time-based: C<seconds-microseconds-pid-counter>.
+
+=cut
