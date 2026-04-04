@@ -473,6 +473,33 @@ DBIx-DataModel-Plugin-CDC/
 
 ---
 
+## Inflated / Multivalue Columns
+
+If your ORM inflates column values into references (e.g., a pipe-delimited
+Oracle field expanded into an arrayref at the Perl layer), CDC captures the
+**inflated Perl value**, not the raw database string.  This is usually what
+you want — the CDC event contains the richer data structure.
+
+```perl
+# Oracle column: 'perl|oracle'
+# ORM inflates:  ['perl', 'oracle']
+# CDC event:     { TAGS => ['perl', 'oracle'] }   ← arrayref preserved
+# log_to_dbi:    {"TAGS":["perl","oracle"]}        ← valid JSON
+```
+
+**`changed_columns` caveat**: the diff compares values by string equality.
+For inflated refs (arrayrefs, hashrefs), two values with identical content
+but different references are reported as changed.  This produces
+**false positives** (column reported as changed when content is the same)
+but never false negatives.  This is safe — you may see extra columns in
+`changed_columns`, but you'll never miss a real change.
+
+Composition component keys (e.g., `employees` from a `Composition`
+declaration) are automatically excluded from snapshots via
+`metadm->components`.
+
+---
+
 ## Known Limitations
 
 | Limitation | Notes |
@@ -481,6 +508,8 @@ DBIx-DataModel-Plugin-CDC/
 | Pre-fetch overhead | Class-method `update`/`delete` runs a SELECT first |
 | Single-process IDs | Event IDs are unique per process; use the DB-generated `event_id` column for global ordering |
 | JSON in CLOB | Wide tables produce large JSON payloads in Oracle CLOB columns |
+| `changed_columns` on refs | Inflated values compared by refaddr, not deep equality — may report false positives |
+| Perl-side snapshots | CDC captures ORM-inflated values, not raw DB column values |
 
 ---
 
