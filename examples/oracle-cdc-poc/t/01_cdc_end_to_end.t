@@ -568,7 +568,7 @@ subtest 'clear_events_for – selective' => sub {
 # ===============================================================
 
 subtest 'Callback receives correct event envelope' => sub {
-    plan tests => 7;
+    plan tests => 10;
     clean_tables();
     @callback_events = ();
     App::Schema->table('Department')->insert({ name => 'Env', location => 'G' });
@@ -580,6 +580,10 @@ subtest 'Callback receives correct event envelope' => sub {
     is($ev->{table_name}, 'DEPARTMENTS', 'table_name');
     is($ev->{schema_name}, 'App::Schema', 'schema_name');
     is(ref $ev->{new_data}, 'HASH', 'new_data is hashref');
+    # row_id and primary_key
+    is(ref $ev->{row_id}, 'HASH', 'row_id is hashref');
+    ok(defined $ev->{row_id}{ID}, 'row_id contains PK value');
+    is_deeply($ev->{primary_key}, ['ID'], 'primary_key lists PK column names');
 };
 
 subtest 'Callback receives changed_columns for UPDATE' => sub {
@@ -738,8 +742,8 @@ subtest 'log_to_stderr – structured log output' => sub {
     _setup_cdc(capture_old => 1);
 };
 
-subtest 'capture_old => 0 – no pre-fetch, no old_data' => sub {
-    plan tests => 6;
+subtest 'capture_old => 0 – no pre-fetch, row_id always present' => sub {
+    plan tests => 7;
     clean_tables();
     _setup_cdc(capture_old => 0);
 
@@ -771,10 +775,11 @@ subtest 'capture_old => 0 – no pre-fetch, no old_data' => sub {
     # Instance DELETE — old_data undef
     $dept = _fetch_dept({ name => 'Light' });
     $CDC->clear_events('App::Schema');
+    @callback_events = ();
     $dept->delete();
-    my $del = $CDC->latest_event('App::Schema',
-        table => 'departments', operation => 'DELETE');
-    ok(!defined $del->{old_data}, 'DELETE: old_data is undef');
+    my @del_cb = grep { $_->{operation} eq 'DELETE' } @callback_events;
+    ok(!defined $del_cb[-1]{old_data}, 'DELETE: old_data is undef');
+    ok(defined $del_cb[-1]{row_id}{ID}, 'DELETE: row_id has PK');
 
     _setup_cdc(capture_old => 1);
 };

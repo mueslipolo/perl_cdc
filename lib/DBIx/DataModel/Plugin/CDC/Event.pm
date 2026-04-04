@@ -33,6 +33,8 @@ sub build {
         occurred_at     => _format_ts($sec),
         schema_name     => $args{schema_name},
         table_name      => $args{table_name},
+        primary_key     => $args{primary_key},
+        row_id          => $args{row_id},
         operation       => $args{operation},
         old_data        => $old,
         new_data        => $new,

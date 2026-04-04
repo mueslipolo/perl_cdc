@@ -58,6 +58,45 @@ sub _cdc_dispatch {
     DBIx::DataModel::Plugin::CDC->dispatch($schema_class, $schema, $event);
 }
 
+# Shortcut: build event with primary_key auto-populated
+sub _cdc_event {
+    my ($self, %args) = @_;
+    $args{primary_key} //= [ map { uc($_) } $self->metadm->primary_key ];
+    return DBIx::DataModel::Plugin::CDC::Event->build(%args);
+}
+
+# ---------------------------------------------------------------
+# _cdc_pk_from($obj) -> \%pk_hash
+#
+# Extracts primary key columns from a row object.  Keys upper-cased.
+# ---------------------------------------------------------------
+sub _cdc_pk_from {
+    my ($self, $obj) = @_;
+    my @pk_cols = $self->metadm->primary_key;
+    return { map { uc($_) => $obj->{$_} } @pk_cols };
+}
+
+# ---------------------------------------------------------------
+# _cdc_fetch_pks($where) -> \@pk_hashes
+#
+# Lightweight SELECT of just the PK columns for class-method ops
+# when capture_old is off.  Much cheaper than SELECT *.
+# ---------------------------------------------------------------
+sub _cdc_fetch_pks {
+    my ($self, $where) = @_;
+    my @pk_cols = $self->metadm->primary_key;
+    my $dbh     = $self->schema->dbh;
+    my $table   = $self->metadm->db_from;
+    my $sqla    = $self->schema->sql_abstract;
+
+    my ($sql, @bind) = $sqla->select(
+        -from    => $table,
+        -columns => \@pk_cols,
+        -where   => $where,
+    );
+    return $dbh->selectall_arrayref($sql, { Slice => {} }, @bind);
+}
+
 sub _cdc_capture_old {
     my ($self) = @_;
     return DBIx::DataModel::Plugin::CDC->capture_old(
@@ -112,14 +151,14 @@ sub insert {
 
         for my $rec (@args) {
             next unless ref $rec;
-            my $event = DBIx::DataModel::Plugin::CDC::Event->build(
+            $self->_cdc_dispatch($self->_cdc_event(
                 schema_name => $schema_class,
                 table_name  => $tname,
                 operation   => 'INSERT',
+                row_id      => $self->_cdc_pk_from($rec),
                 old_data    => undef,
                 new_data    => _cdc_snapshot(undef, $rec),
-            );
-            $self->_cdc_dispatch($event);
+            ));
         }
 
         return wantarray ? @results : $results[0];
@@ -155,10 +194,11 @@ sub update {
         my $new = $old ? { %$old, %changes }
                        : { _cdc_snapshot(undef, $self), %changes };
 
-        $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
+        $self->_cdc_dispatch($self->_cdc_event(
             schema_name => $schema_class,
             table_name  => $tname,
             operation   => 'UPDATE',
+            row_id      => $self->_cdc_pk_from($self),
             old_data    => $old,
             new_data    => $new,
         ));
@@ -176,6 +216,7 @@ sub _cdc_class_update {
 
     if ($want_old) {
         # Full mode: pre-fetch rows for old_data + complete new_data
+        my @pk_cols = map { uc($_) } $self->metadm->primary_key;
         return $self->_cdc_ensure_atomic(sub {
             my $rows = $self->select(-where => $where);
             my @snapshots = map { _cdc_snapshot(undef, $_) } @$rows;
@@ -183,10 +224,12 @@ sub _cdc_class_update {
             my $result = $SUPER_UPDATE->($self, @args);
 
             for my $old (@snapshots) {
-                $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
+                my %pk = map { $_ => $old->{$_} } @pk_cols;
+                $self->_cdc_dispatch($self->_cdc_event(
                     schema_name => $schema_class,
                     table_name  => $tname,
                     operation   => 'UPDATE',
+                    row_id      => \%pk,
                     old_data    => $old,
                     new_data    => { %$old, %changes },
                 ));
@@ -196,17 +239,23 @@ sub _cdc_class_update {
         });
     }
 
-    # Light mode: no pre-fetch, single event with just the changed values
+    # Light mode: fetch only PKs (cheap), one event per row
     return $self->_cdc_ensure_atomic(sub {
+        my $pks = $self->_cdc_fetch_pks($where);
+
         my $result = $SUPER_UPDATE->($self, @args);
 
-        $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
-            schema_name => $schema_class,
-            table_name  => $tname,
-            operation   => 'UPDATE',
-            old_data    => undef,
-            new_data    => \%changes,
-        ));
+        for my $pk_row (@$pks) {
+            my %pk = map { uc($_) => $pk_row->{$_} } keys %$pk_row;
+            $self->_cdc_dispatch($self->_cdc_event(
+                schema_name => $schema_class,
+                table_name  => $tname,
+                operation   => 'UPDATE',
+                row_id      => \%pk,
+                old_data    => undef,
+                new_data    => \%changes,
+            ));
+        }
 
         return $result;
     });
@@ -236,10 +285,11 @@ sub delete {
     return $self->_cdc_ensure_atomic(sub {
         my $result = $SUPER_DELETE->($self, @args);
 
-        $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
+        $self->_cdc_dispatch($self->_cdc_event(
             schema_name => $schema_class,
             table_name  => $tname,
             operation   => 'DELETE',
+            row_id      => $self->_cdc_pk_from($self),
             old_data    => $old,
             new_data    => undef,
         ));
@@ -254,7 +304,7 @@ sub _cdc_class_delete {
     my $where = $named{'-where'} || {};
 
     if ($want_old) {
-        # Full mode: pre-fetch for old_data
+        my @pk_cols = map { uc($_) } $self->metadm->primary_key;
         return $self->_cdc_ensure_atomic(sub {
             my $rows = $self->select(-where => $where);
             my @snapshots = map { _cdc_snapshot(undef, $_) } @$rows;
@@ -262,10 +312,12 @@ sub _cdc_class_delete {
             my $result = $SUPER_DELETE->($self, @args);
 
             for my $old (@snapshots) {
-                $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
+                my %pk = map { $_ => $old->{$_} } @pk_cols;
+                $self->_cdc_dispatch($self->_cdc_event(
                     schema_name => $schema_class,
                     table_name  => $tname,
                     operation   => 'DELETE',
+                    row_id      => \%pk,
                     old_data    => $old,
                     new_data    => undef,
                 ));
@@ -275,17 +327,23 @@ sub _cdc_class_delete {
         });
     }
 
-    # Light mode: no pre-fetch, single event
+    # Light mode: fetch only PKs (cheap), one event per row
     return $self->_cdc_ensure_atomic(sub {
+        my $pks = $self->_cdc_fetch_pks($where);
+
         my $result = $SUPER_DELETE->($self, @args);
 
-        $self->_cdc_dispatch(DBIx::DataModel::Plugin::CDC::Event->build(
-            schema_name => $schema_class,
-            table_name  => $tname,
-            operation   => 'DELETE',
-            old_data    => undef,
-            new_data    => undef,
-        ));
+        for my $pk_row (@$pks) {
+            my %pk = map { uc($_) => $pk_row->{$_} } keys %$pk_row;
+            $self->_cdc_dispatch($self->_cdc_event(
+                schema_name => $schema_class,
+                table_name  => $tname,
+                operation   => 'DELETE',
+                row_id      => \%pk,
+                old_data    => undef,
+                new_data    => undef,
+            ));
+        }
 
         return $result;
     });
