@@ -12,6 +12,7 @@ requires 'namespace::clean', '>= 0.27';
 on 'test' => sub {
     requires 'Test::More',      '>= 1.302';
     requires 'Test::Exception';
+    requires 'DBD::SQLite',     '>= 1.50';
 };
 
 # Integration tests (examples/oracle-cdc-poc)

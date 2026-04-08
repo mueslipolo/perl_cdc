@@ -24,6 +24,7 @@ WriteMakefile(
     TEST_REQUIRES => {
         'Test::More'      => '1.302',
         'Test::Exception' => '0',
+        'DBD::SQLite'     => '1.50',
     },
 
     META_MERGE => {
