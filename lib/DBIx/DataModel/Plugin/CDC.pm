@@ -4,6 +4,7 @@ use strict;
 use warnings;
 use Carp qw(croak);
 use Scalar::Util qw(refaddr);
+use Try::Tiny;
 use Cpanel::JSON::XS ();
 use namespace::clean;
 
@@ -34,9 +35,13 @@ sub setup {
     my %tracked;
 
     if ($tables_arg eq 'all') {
-        $tracked{ $_->name } = 1 for $schema_class->metadm->tables;
+        for my $table ($schema_class->metadm->tables) {
+            $tracked{ $table->name } = 1;
+        }
     } elsif (ref $tables_arg eq 'ARRAY') {
-        $tracked{$_} = 1 for @$tables_arg;
+        for my $name (@$tables_arg) {
+            $tracked{$name} = 1;
+        }
     } else {
         croak "tables must be 'all' or an arrayref";
     }
@@ -189,10 +194,14 @@ sub dispatch {
     if (@async) {
         if ($schema_obj->{transaction_dbhs}) {
             $schema_obj->do_after_commit(sub {
-                _call_safe($_, $event, $schema_obj) for @async;
+                for my $listener (@async) {
+                    _call_safe($listener, $event, $schema_obj);
+                }
             });
         } else {
-            _call_safe($_, $event, $schema_obj) for @async;
+            for my $listener (@async) {
+                _call_safe($listener, $event, $schema_obj);
+            }
         }
     }
 }
@@ -203,14 +212,16 @@ sub dispatch {
 
 sub _call_safe {
     my ($listener, $event, $schema) = @_;
-    my $ok = eval { $listener->{cb}->($event, $schema); 1 };
-    return if $ok;
-    my $err = $@;
-    die $err  if $listener->{on_error} eq 'abort';
-    warn "CDC listener failed: $err" if $listener->{on_error} eq 'warn';
-    # ignore: silent (logs with CDC_DEBUG)
-    warn "CDC listener failed (ignored): $err"
-        if $listener->{on_error} eq 'ignore' && $ENV{CDC_DEBUG};
+    try {
+        $listener->{cb}->($event, $schema);
+    } catch {
+        my $err = $_;
+        die $err  if $listener->{on_error} eq 'abort';
+        warn "CDC listener failed: $err" if $listener->{on_error} eq 'warn';
+        # ignore: silent (logs with CDC_DEBUG)
+        warn "CDC listener failed (ignored): $err"
+            if $listener->{on_error} eq 'ignore' && $ENV{CDC_DEBUG};
+    };
 }
 
 sub _get_cached_sth {
@@ -239,8 +250,9 @@ sub _dbi_table {
     my ($class, $schema_class) = @_;
     my $cfg = $REGISTRY{$schema_class}
         or croak 'CDC not configured';
-    return $cfg->{dbi_table}
+    my $table = $cfg->{dbi_table}
         or croak 'No DBI logging configured — call log_to_dbi() first';
+    return $table;
 }
 
 sub events_for {
@@ -295,15 +307,15 @@ sub event_pairs {
     my ($class, $schema_class, %args) = @_;
     $args{operation} = 'UPDATE';
     my $events = $class->events_for($schema_class, %args);
-    return [
-        map {
-            my $old = $_->{old_data};
-            my $new = $_->{new_data};
-            $old = $JSON_DECODE->decode($old) if defined $old && !ref $old;
-            $new = $JSON_DECODE->decode($new) if defined $new && !ref $new;
-            [$old // {}, $new // {}]
-        } @$events
-    ];
+    my @pairs;
+    for my $ev (@$events) {
+        my $old = $ev->{old_data};
+        my $new = $ev->{new_data};
+        $old = $JSON_DECODE->decode($old) if defined $old && !ref $old;
+        $new = $JSON_DECODE->decode($new) if defined $new && !ref $new;
+        push @pairs, [$old // {}, $new // {}];
+    }
+    return \@pairs;
 }
 
 1;

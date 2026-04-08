@@ -11,10 +11,13 @@ use namespace::clean;
 
 our $VERSION = '2.00';
 
-# Resolve parent methods once at compile time.
-my $SUPER_INSERT = __PACKAGE__->can('DBIx::DataModel::Source::Table::insert');
-my $SUPER_UPDATE = __PACKAGE__->can('DBIx::DataModel::Source::Table::update');
-my $SUPER_DELETE = __PACKAGE__->can('DBIx::DataModel::Source::Table::delete');
+# Helper: detect class-method style calls like ->update(-set => ..., -where => ...)
+sub _is_named_args {
+    my (@args) = @_;
+    return 0 unless @args;
+    return 0 if ref $args[0];
+    return ($args[0] // '') =~ /^-/ ? 1 : 0;
+}
 
 # ---------------------------------------------------------------
 # _cdc_table_name() -> $name | undef
@@ -40,15 +43,20 @@ sub _cdc_snapshot {
 
     # Build skip-set: internal keys + composition component role names
     my %skip;
-    if (my $metadm = eval { $obj->metadm }) {
-        $skip{$_} = 1 for $metadm->components;
+    if ($obj->can('metadm')) {
+        my $metadm = $obj->metadm;
+        for my $comp ($metadm->components) {
+            $skip{$comp} = 1;
+        }
     }
 
-    return {
-        map  { uc($_) => $obj->{$_} }
-        grep { !/^__/ && !$skip{$_} }
-        keys %$obj
-    };
+    my %snapshot;
+    for my $key (keys %$obj) {
+        next if $key =~ /^__/;
+        next if $skip{$key};
+        $snapshot{ uc($key) } = $obj->{$key};
+    }
+    return \%snapshot;
 }
 
 sub _cdc_dispatch {
@@ -61,7 +69,10 @@ sub _cdc_dispatch {
 # Shortcut: build event with primary_key auto-populated
 sub _cdc_event {
     my ($self, %args) = @_;
-    $args{primary_key} //= [ map { uc($_) } $self->metadm->primary_key ];
+    if (!defined $args{primary_key}) {
+        my @pk_cols = $self->metadm->primary_key;
+        $args{primary_key} = [ map { uc($_) } @pk_cols ];
+    }
     return DBIx::DataModel::Plugin::CDC::Event->build(%args);
 }
 
@@ -122,6 +133,8 @@ sub _cdc_ensure_atomic {
     local $dbh->{AutoCommit} = 0;
     local $dbh->{RaiseError} = 1;
     my @result;
+    # wantarray must be captured here — inside the try block it
+    # would reflect the try's own calling context, not the caller's.
     my $wantarray = wantarray;
     try {
         @result = $wantarray ? $code->() : (scalar $code->());
@@ -147,7 +160,7 @@ sub insert {
     my $schema_class = $self->schema->metadm->class;
 
     return $self->_cdc_ensure_atomic(sub {
-        my @results = $SUPER_INSERT->($self, @args);
+        my @results = $self->SUPER::insert(@args);
 
         for my $rec (@args) {
             next unless ref $rec;
@@ -177,9 +190,7 @@ sub update {
 
     my $schema_class = $self->schema->metadm->class;
     my $want_old     = $self->_cdc_capture_old;
-    my $is_class_method = @args && !ref $args[0] && ($args[0] // '') =~ /^-/;
-
-    if ($is_class_method) {
+    if (_is_named_args(@args)) {
         return $self->_cdc_class_update($schema_class, $tname, $want_old, @args);
     }
 
@@ -187,12 +198,12 @@ sub update {
     my $old = $want_old ? _cdc_snapshot(undef, $self) : undef;
 
     return $self->_cdc_ensure_atomic(sub {
-        my $result = $SUPER_UPDATE->($self, @args);
+        my $result = $self->SUPER::update(@args);
 
         my $to_set  = ref $args[0] eq 'HASH' ? $args[0] : {};
         my %changes = map { uc($_) => $to_set->{$_} } keys %$to_set;
         my $new = $old ? { %$old, %changes }
-                       : { _cdc_snapshot(undef, $self), %changes };
+                       : { %{_cdc_snapshot(undef, $self)}, %changes };
 
         $self->_cdc_dispatch($self->_cdc_event(
             schema_name => $schema_class,
@@ -221,7 +232,7 @@ sub _cdc_class_update {
             my $rows = $self->select(-where => $where);
             my @snapshots = map { _cdc_snapshot(undef, $_) } @$rows;
 
-            my $result = $SUPER_UPDATE->($self, @args);
+            my $result = $self->SUPER::update(@args);
 
             for my $old (@snapshots) {
                 my %pk = map { $_ => $old->{$_} } @pk_cols;
@@ -243,7 +254,7 @@ sub _cdc_class_update {
     return $self->_cdc_ensure_atomic(sub {
         my $pks = $self->_cdc_fetch_pks($where);
 
-        my $result = $SUPER_UPDATE->($self, @args);
+        my $result = $self->SUPER::update(@args);
 
         for my $pk_row (@$pks) {
             my %pk = map { uc($_) => $pk_row->{$_} } keys %$pk_row;
@@ -273,9 +284,7 @@ sub delete {
 
     my $schema_class = $self->schema->metadm->class;
     my $want_old     = $self->_cdc_capture_old;
-    my $is_class_method = @args && !ref $args[0] && ($args[0] // '') =~ /^-/;
-
-    if ($is_class_method) {
+    if (_is_named_args(@args)) {
         return $self->_cdc_class_delete($schema_class, $tname, $want_old, @args);
     }
 
@@ -283,7 +292,7 @@ sub delete {
     my $old = $want_old ? _cdc_snapshot(undef, $self) : undef;
 
     return $self->_cdc_ensure_atomic(sub {
-        my $result = $SUPER_DELETE->($self, @args);
+        my $result = $self->SUPER::delete(@args);
 
         $self->_cdc_dispatch($self->_cdc_event(
             schema_name => $schema_class,
@@ -309,7 +318,7 @@ sub _cdc_class_delete {
             my $rows = $self->select(-where => $where);
             my @snapshots = map { _cdc_snapshot(undef, $_) } @$rows;
 
-            my $result = $SUPER_DELETE->($self, @args);
+            my $result = $self->SUPER::delete(@args);
 
             for my $old (@snapshots) {
                 my %pk = map { $_ => $old->{$_} } @pk_cols;
@@ -331,7 +340,7 @@ sub _cdc_class_delete {
     return $self->_cdc_ensure_atomic(sub {
         my $pks = $self->_cdc_fetch_pks($where);
 
-        my $result = $SUPER_DELETE->($self, @args);
+        my $result = $self->SUPER::delete(@args);
 
         for my $pk_row (@$pks) {
             my %pk = map { uc($_) => $pk_row->{$_} } keys %$pk_row;
