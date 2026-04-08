@@ -657,7 +657,6 @@ declaration) are automatically excluded from snapshots via
 | JSON in CLOB | Wide tables produce large JSON payloads in Oracle CLOB columns |
 | `changed_columns` on refs | Inflated values compared by refaddr, not deep equality — may report false positives |
 | Perl-side snapshots | CDC captures ORM-inflated values, not raw DB column values |
-| Not thread-safe | JSON encoder singletons and `%REGISTRY` are not safe under Perl ithreads |
 
 ---
 

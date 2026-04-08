@@ -9,9 +9,6 @@ use namespace::clean;
 
 our $VERSION = '2.00';
 
-# Thread caveat: Cpanel::JSON::XS objects carry internal C state and
-# are not safe to share across Perl ithreads.  This is fine for the
-# standard single-threaded forking deployment model.
 my $JSON_ENCODE = Cpanel::JSON::XS->new->utf8->canonical->allow_nonref;
 my $JSON_DECODE = Cpanel::JSON::XS->new->canonical->allow_nonref;
 
