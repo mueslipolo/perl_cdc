@@ -453,8 +453,8 @@ No base class to inherit.  No interface to implement.  Just a sub.
 | `Table->insert({...})` | Yes | `row_id` + full `new_data` |
 | `$row->update({...})` | Yes | `row_id` + full `new_data` from `$self` |
 | `$row->delete()` | Yes | `row_id` always; `old_data` if `capture_old` |
-| `Table->update(-set, -where)` | Yes | PK-only SELECT (light) or full SELECT (`capture_old`) |
-| `Table->delete(-where)` | Yes | PK-only SELECT (light) or full SELECT (`capture_old`) |
+| `Table->update(-set, -where)` | Yes | `capture_old=0`: pre-fetches PKs only; `capture_old=1`: pre-fetches full rows |
+| `Table->delete(-where)` | Yes | `capture_old=0`: pre-fetches PKs only; `capture_old=1`: pre-fetches full rows |
 | Composition subtree insert | Yes | Child `insert()` is hooked |
 | Composition cascaded delete | Yes | Child `delete()` is hooked |
 | `$dbh->do(...)` / raw SQL | **No** | By design — only ORM operations |
