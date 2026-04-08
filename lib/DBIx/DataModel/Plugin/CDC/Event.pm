@@ -9,14 +9,7 @@ use namespace::clean;
 
 our $VERSION = '2.00';
 
-# Fork caveat: $_pid_hex is captured at require-time (parent PID).
-# After fork, the child inherits the parent's PID hex and counter,
-# which could produce ID collisions within the same second.
-# For forking servers, consider re-requiring the module or accepting
-# the (low) collision risk with the DB event_id as tiebreaker.
-my $_process_id = $$;
-my $_pid_hex    = sprintf '%04x', $_process_id % 65536;
-my $_counter    = 0;
+my $_counter = 0;
 
 sub build {
     my ($class, %args) = @_;
@@ -59,7 +52,8 @@ sub build {
 sub _generate_id {
     my ($sec, $usec) = @_;
     $_counter = ($_counter + 1) % 65536;
-    return sprintf '%08x-%04x-%s-%04x', $sec, $usec >> 4, $_pid_hex, $_counter;
+    my $pid_hex = sprintf '%04x', $$ % 65536;
+    return sprintf '%08x-%04x-%s-%04x', $sec, $usec >> 4, $pid_hex, $_counter;
 }
 
 sub _format_ts {
