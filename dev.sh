@@ -14,6 +14,7 @@ Usage: ./dev.sh <command>
 Commands:
   setup     Install CPAN dependencies into ./local/
   test      Run all tests (unit + SQLite e2e)
+  hello     Run the smoke test (examples/hello_cdc.pl)
   clean     Remove ./local/ and build artifacts
 EOF
     exit 1
@@ -35,6 +36,11 @@ cmd_test() {
     prove -lv t/
 }
 
+cmd_hello() {
+    export PERL5LIB="${SCRIPT_DIR}/local/lib/perl5:${SCRIPT_DIR}/lib"
+    perl examples/hello_cdc.pl
+}
+
 cmd_clean() {
     rm -rf local/ blib/ pm_to_blib Makefile MYMETA.*
     echo "Cleaned."
@@ -45,6 +51,7 @@ cmd_clean() {
 case "$1" in
     setup) cmd_setup ;;
     test)  cmd_test  ;;
+    hello) cmd_hello ;;
     clean) cmd_clean ;;
     *)     usage     ;;
 esac

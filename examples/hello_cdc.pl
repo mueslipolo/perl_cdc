@@ -3,13 +3,17 @@
 # hello_cdc.pl — Minimal smoke test for DBIx::DataModel::Plugin::CDC
 #
 # Usage:
-#   perl -Ilib examples/hello_cdc.pl
+#   ./dev.sh hello            # easiest
+#   perl -Ilib -Ilocal/lib/perl5 examples/hello_cdc.pl
 #
 # Requires: DBD::SQLite (uses in-memory database, no setup needed)
 # =============================================================
 
 use strict;
 use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib", "$FindBin::Bin/../local/lib/perl5";
 use DBI;
 use DBIx::DataModel;
 use DBIx::DataModel::Plugin::CDC;
