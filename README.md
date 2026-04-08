@@ -123,7 +123,7 @@ For **DELETE**, the event contains `row_id` and (with `capture_old => 1`)
 the full row in `old_data`.
 
 **Class-method operations** (`Table->update(-set => {...}, -where => {...})`)
-fetch the affected PKs (lightweight `SELECT pk_cols` — not `SELECT *`),
+fetch the affected PKs (`SELECT pk_cols` only — not `SELECT *`),
 run the DML, then generate one CDC event per affected row.  With
 `capture_old => 1`, a full `SELECT *` is used instead.
 
@@ -356,7 +356,7 @@ $CDC->on('App::Schema', '*' => sub {
 |---|---|
 | `abort` | Exception propagates → transaction rolls back → DML cancelled |
 | `warn` | Warning emitted → DML commits normally |
-| `ignore` | Silently suppressed (logs with `CDC_DEBUG=1` env var) |
+| `ignore` | Warning emitted but execution continues — DML commits normally |
 
 ### `->log_to_dbi($schema, $table_name?)`
 
@@ -455,8 +455,8 @@ No base class to inherit.  No interface to implement.  Just a sub.
 | `$row->delete()` | Yes | `row_id` always; `old_data` if `capture_old` |
 | `Table->update(-set, -where)` | Yes | `capture_old=0`: pre-fetches PKs only; `capture_old=1`: pre-fetches full rows |
 | `Table->delete(-where)` | Yes | `capture_old=0`: pre-fetches PKs only; `capture_old=1`: pre-fetches full rows |
-| Composition subtree insert | Yes | Child `insert()` is hooked |
-| Composition cascaded delete | Yes | Child `delete()` is hooked |
+| Composition subtree insert | Yes | Each child `insert()` generates its own CDC event |
+| Composition cascaded delete | Yes | Each child `delete()` generates its own CDC event |
 | `$dbh->do(...)` / raw SQL | **No** | By design — only ORM operations |
 
 ---
@@ -559,19 +559,19 @@ Zero changes to the shared suite.
 
 ### Test Coverage
 
-**56 total tests**: 24 unit + 32 e2e (SQLite).  Oracle adds ~20 more.
+**59 total tests**: 26 unit + 33 e2e (SQLite).  Oracle adds ~15 more.
 
 #### Unit Tests (t/00-04 — no database, runs on CPAN smoke)
 
 | File | Tests | Covers |
 |---|---|---|
 | `00_compile.t` | 3 | All 3 modules load |
-| `01_event.t` | 15 | Event::build, unique IDs (1000), ISO 8601, changed_columns |
-| `02_handler_base.t` | 16 | `on()` validation, `log_to_dbi` SQL injection, `log_to_stderr`, chaining |
-| `03_handler_multi.t` | 10 | Operation filtering, wildcard, listener ordering, abort/warn/ignore |
-| `04_setup.t` | 7 | Registry, selective tables, `is_tracked`, validation |
+| `01_event.t` | 5 | Event::build, unique IDs (1000), changed_columns, required args validation |
+| `02_handler_base.t` | 6 | `on()` validation (incl. operation), `log_to_dbi` SQL injection, chaining |
+| `03_handler_multi.t` | 7 | Operation filtering, wildcard, listener ordering, abort/warn/ignore |
+| `04_setup.t` | 5 | Registry, selective tables, `is_tracked`, double-setup warning |
 
-#### E2E Shared Suite (30 subtests — runs on every backend)
+#### E2E Shared Suite (31 subtests — runs on every backend)
 
 | Category | Subtests | Covers |
 |---|---|---|
@@ -587,6 +587,7 @@ Zero changes to the shared suite.
 | DB verification | 2 | INSERT/UPDATE data matches actual DB state |
 | Listeners | 2 | Multiple listener ordering, operation-specific filtering |
 | Selective tracking | 1 | Untracked table passthrough |
+| Graceful degradation | 1 | event_pairs with capture_old=0 |
 
 #### SQLite-Specific (t/10_e2e_sqlite.t)
 
