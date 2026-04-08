@@ -1,0 +1,11 @@
+severity = 4
+verbose  = %f:%l: %m (%p, severity %s)\n
+
+# We use postfix dereference and other modern Perl features
+[-ValuesAndExpressions::ProhibitMixedBooleanOperators]
+
+# CDC.pm uses string eval nowhere; Try::Tiny is used instead
+[-ErrorHandling::RequireCheckingReturnValueOfEval]
+
+# namespace::clean removes imports; Perl::Critic can't see that
+[-Modules::ProhibitAutomaticExportation]

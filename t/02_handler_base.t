@@ -17,7 +17,7 @@ Test::On::Schema->Table(Widget => 'widgets', 'id');
 my $CDC = 'DBIx::DataModel::Plugin::CDC';
 
 subtest 'on() – validation' => sub {
-    plan tests => 5;
+    plan tests => 6;
     $CDC->setup('Test::On::Schema', tables => 'all', force => 1);
 
     throws_ok { $CDC->on() }
@@ -25,6 +25,9 @@ subtest 'on() – validation' => sub {
 
     throws_ok { $CDC->on('Test::On::Schema') }
         qr/operation/, 'missing operation croaks';
+
+    throws_ok { $CDC->on('Test::On::Schema', 'TYPO', sub {}) }
+        qr/invalid operation/, 'invalid operation croaks';
 
     throws_ok { $CDC->on('Test::On::Schema', 'insert') }
         qr/coderef/, 'missing coderef croaks';

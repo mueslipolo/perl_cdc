@@ -3,13 +3,15 @@ package DBIx::DataModel::Plugin::CDC;
 use strict;
 use warnings;
 use Carp qw(croak carp);
-use Scalar::Util qw(refaddr);
 use Try::Tiny;
 use Cpanel::JSON::XS ();
 use namespace::clean;
 
 our $VERSION = '2.00';
 
+# Thread caveat: Cpanel::JSON::XS objects carry internal C state and
+# are not safe to share across Perl ithreads.  This is fine for the
+# standard single-threaded forking deployment model.
 my $JSON_ENCODE = Cpanel::JSON::XS->new->utf8->canonical->allow_nonref;
 my $JSON_DECODE = Cpanel::JSON::XS->new->canonical->allow_nonref;
 
@@ -58,7 +60,6 @@ sub setup {
         capture_old => $args{capture_old} // 0,
         listeners   => [],
         dbi_table   => undef,
-        _sth_cache  => {},
     };
 
     return $class;
@@ -66,7 +67,8 @@ sub setup {
 
 sub config_for {
     my ($class, $schema_class) = @_;
-    return $REGISTRY{$schema_class};
+    my $cfg = $REGISTRY{$schema_class} or return undef;
+    return { %$cfg };
 }
 
 sub is_tracked {
@@ -77,7 +79,7 @@ sub is_tracked {
 
 sub capture_old {
     my ($class, $schema_class) = @_;
-    my $cfg = $REGISTRY{$schema_class} or return 1;
+    my $cfg = $REGISTRY{$schema_class} or return 0;
     return $cfg->{capture_old};
 }
 
@@ -97,6 +99,8 @@ sub on {
     my ($class, $schema_class, $operation, $cb, $opts) = @_;
     croak 'on() requires a schema class'  unless $schema_class;
     croak 'on() requires an operation'    unless $operation;
+    croak "invalid operation: $operation"
+        unless $operation =~ /\A(?:\*|INSERT|UPDATE|DELETE)\z/i;
     croak 'on() requires a coderef'       unless ref $cb eq 'CODE';
 
     $opts //= {};
@@ -223,29 +227,23 @@ sub _call_safe {
         $listener->{cb}->($event, $schema);
     } catch {
         my $err = $_;
-        die $err  if $listener->{on_error} eq 'abort';
-        warn "CDC listener failed: $err" if $listener->{on_error} eq 'warn';
-        # ignore: silent (logs with CDC_DEBUG)
-        warn "CDC listener failed (ignored): $err"
-            if $listener->{on_error} eq 'ignore' && $ENV{CDC_DEBUG};
+        die $err if $listener->{on_error} eq 'abort';
+        warn "CDC listener failed: $err"            if $listener->{on_error} eq 'warn';
+        warn "CDC listener failed (ignored): $err"  if $listener->{on_error} eq 'ignore';
     };
 }
 
 sub _get_cached_sth {
     my ($cfg, $dbh, $table) = @_;
-    my $addr = refaddr($dbh);
-    my $gen  = $dbh->{dbi_connect_generation} // 0;
-    my $cached = $cfg->{_sth_cache}{$addr};
+    my $key = "private_cdc_sth_$table";
+    return $dbh->{$key} if $dbh->{$key};
 
-    if ($cached && $cached->{gen} == $gen) {
-        return $cached->{sth};
-    }
-
+    my $qt = $dbh->quote_identifier($table);
     my $sth = $dbh->prepare(
-        qq{INSERT INTO $table (table_name, operation, old_data, new_data)
+        qq{INSERT INTO $qt (table_name, operation, old_data, new_data)
            VALUES (?, ?, ?, ?)}
     );
-    $cfg->{_sth_cache}{$addr} = { sth => $sth, gen => $gen };
+    $dbh->{$key} = $sth;
     return $sth;
 }
 
@@ -272,7 +270,8 @@ sub events_for {
     my $table = uc $args{table};
     my $op    = defined $args{operation} ? uc $args{operation} : undef;
 
-    my $sql  = "SELECT * FROM $tbl WHERE table_name = ?";
+    my $qt   = $dbh->quote_identifier($tbl);
+    my $sql  = "SELECT * FROM $qt WHERE table_name = ?";
     my @bind = ($table);
     if (defined $op) {
         $sql .= ' AND operation = ?';
@@ -297,15 +296,21 @@ sub latest_event {
 sub clear_events {
     my ($class, $schema_class) = @_;
     my $tbl = $class->_dbi_table($schema_class);
-    $schema_class->singleton->dbh->do("DELETE FROM $tbl");
+    my $dbh = $schema_class->singleton->dbh
+        or croak 'No active database connection';
+    my $qt  = $dbh->quote_identifier($tbl);
+    $dbh->do("DELETE FROM $qt");
 }
 
 sub clear_events_for {
     my ($class, $schema_class, %args) = @_;
     croak 'table required' unless $args{table};
     my $tbl = $class->_dbi_table($schema_class);
-    $schema_class->singleton->dbh->do(
-        "DELETE FROM $tbl WHERE table_name = ?",
+    my $dbh = $schema_class->singleton->dbh
+        or croak 'No active database connection';
+    my $qt  = $dbh->quote_identifier($tbl);
+    $dbh->do(
+        "DELETE FROM $qt WHERE table_name = ?",
         undef, uc $args{table},
     );
 }
@@ -318,8 +323,12 @@ sub event_pairs {
     for my $ev (@$events) {
         my $old = $ev->{old_data};
         my $new = $ev->{new_data};
-        $old = $JSON_DECODE->decode($old) if defined $old && !ref $old;
-        $new = $JSON_DECODE->decode($new) if defined $new && !ref $new;
+        try {
+            $old = $JSON_DECODE->decode($old) if defined $old && !ref $old;
+            $new = $JSON_DECODE->decode($new) if defined $new && !ref $new;
+        } catch {
+            croak "CDC: malformed JSON in event row $ev->{event_id}: $_";
+        };
         push @pairs, [$old // {}, $new // {}];
     }
     return \@pairs;

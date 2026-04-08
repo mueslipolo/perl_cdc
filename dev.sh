@@ -15,6 +15,7 @@ Commands:
   setup     Install CPAN dependencies into ./local/
   test      Run all tests (unit + SQLite e2e)
   hello     Run the smoke test (examples/hello_cdc.pl)
+  lint      Run perlcritic on lib/ (requires Perl::Critic)
   clean     Remove ./local/ and build artifacts
 EOF
     exit 1
@@ -41,6 +42,14 @@ cmd_hello() {
     perl examples/hello_cdc.pl
 }
 
+cmd_lint() {
+    if ! command -v perlcritic >/dev/null 2>&1; then
+        echo "perlcritic not found. Install with: cpanm Perl::Critic"
+        exit 1
+    fi
+    perlcritic --profile .perlcriticrc lib/
+}
+
 cmd_clean() {
     rm -rf local/ blib/ pm_to_blib Makefile MYMETA.*
     echo "Cleaned."
@@ -52,6 +61,7 @@ case "$1" in
     setup) cmd_setup ;;
     test)  cmd_test  ;;
     hello) cmd_hello ;;
+    lint)  cmd_lint  ;;
     clean) cmd_clean ;;
     *)     usage     ;;
 esac

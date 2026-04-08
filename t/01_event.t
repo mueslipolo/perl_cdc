@@ -26,7 +26,7 @@ subtest 'build – INSERT event' => sub {
 };
 
 subtest 'build – UPDATE with changed_columns' => sub {
-    plan tests => 2;
+    plan tests => 3;
     my $ev = DBIx::DataModel::Plugin::CDC::Event->build(
         schema_name => 'X',
         table_name  => 'T',
@@ -36,6 +36,17 @@ subtest 'build – UPDATE with changed_columns' => sub {
     );
     is_deeply($ev->{changed_columns}, ['B'], 'only B changed');
     ok(!grep({ $_ eq 'A' } @{$ev->{changed_columns}}), 'A not in changed');
+
+    # Key in old but absent from new should be detected
+    my $ev2 = DBIx::DataModel::Plugin::CDC::Event->build(
+        schema_name => 'X',
+        table_name  => 'T',
+        operation   => 'UPDATE',
+        old_data    => { A => 1, B => 2, REMOVED => 'gone' },
+        new_data    => { A => 1, B => 2 },
+    );
+    is_deeply($ev2->{changed_columns}, ['REMOVED'],
+        'column in old but not in new is detected');
 };
 
 subtest 'build – DELETE event' => sub {
@@ -62,6 +73,22 @@ subtest 'build – unique IDs' => sub {
         $ids{ $ev->{cdc_event_id} }++;
     }
     is(scalar keys %ids, 1000, '1000 unique IDs generated');
+};
+
+subtest 'build – required args validation' => sub {
+    plan tests => 2;
+
+    throws_ok {
+        DBIx::DataModel::Plugin::CDC::Event->build(
+            table_name => 'T', old_data => undef, new_data => { A => 1 },
+        );
+    } qr/requires operation/, 'missing operation croaks';
+
+    throws_ok {
+        DBIx::DataModel::Plugin::CDC::Event->build(
+            operation => 'INSERT', old_data => undef, new_data => { A => 1 },
+        );
+    } qr/requires table_name/, 'missing table_name croaks';
 };
 
 done_testing();

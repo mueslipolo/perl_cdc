@@ -400,12 +400,14 @@ CREATE INDEX cdc_events_table_op_idx ON cdc_events (table_name, operation);
 
 ```sql
 CREATE TABLE cdc_events (
-    event_id   NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    event_time TIMESTAMP    DEFAULT SYSTIMESTAMP NOT NULL,
-    table_name VARCHAR2(128) NOT NULL,
-    operation  VARCHAR2(6)   NOT NULL CHECK (operation IN ('INSERT','UPDATE','DELETE')),
-    old_data   CLOB,
-    new_data   CLOB
+    event_id       NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    event_time     TIMESTAMP     DEFAULT SYSTIMESTAMP NOT NULL,
+    table_name     VARCHAR2(128) NOT NULL,
+    operation      VARCHAR2(6)   NOT NULL CHECK (operation IN ('INSERT','UPDATE','DELETE')),
+    old_data       CLOB,
+    new_data       CLOB,
+    session_user   VARCHAR2(128) DEFAULT SYS_CONTEXT('USERENV', 'SESSION_USER'),
+    transaction_id VARCHAR2(64)
 );
 CREATE INDEX cdc_events_table_op_idx ON cdc_events (table_name, operation, event_id);
 ```
@@ -648,11 +650,14 @@ declaration) are automatically excluded from snapshots via
 | Limitation | Notes |
 |---|---|
 | Raw SQL bypass | `$dbh->do(...)` is invisible to the plugin |
+| INSERT captures args, not DB row | DB-generated defaults (`created_at`, sequences) are absent from INSERT `new_data` |
 | Pre-fetch on class-method ops | PK-only SELECT with `capture_old=0`; full SELECT with `capture_old=1` |
 | Single-process IDs | Event IDs are unique per process; use the DB-generated `event_id` column for global ordering |
+| Fork caveat | `cdc_event_id` uses a PID captured at load time; forked children may collide within the same second |
 | JSON in CLOB | Wide tables produce large JSON payloads in Oracle CLOB columns |
 | `changed_columns` on refs | Inflated values compared by refaddr, not deep equality — may report false positives |
 | Perl-side snapshots | CDC captures ORM-inflated values, not raw DB column values |
+| Not thread-safe | JSON encoder singletons and `%REGISTRY` are not safe under Perl ithreads |
 
 ---
 

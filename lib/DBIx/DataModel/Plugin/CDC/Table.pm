@@ -4,6 +4,7 @@ use strict;
 use warnings;
 use parent 'DBIx::DataModel::Source::Table';
 
+use Carp qw(croak);
 use Try::Tiny;
 use DBIx::DataModel::Plugin::CDC;
 use DBIx::DataModel::Plugin::CDC::Event;
@@ -23,7 +24,7 @@ our $VERSION = '2.00';
 # ---------------------------------------------------------------
 
 # Helper: detect class-method style calls like ->update(-set => ..., -where => ...)
-sub _is_named_args {
+sub _cdc_is_named_args {
     my (@args) = @_;
     return 0 unless @args;
     return 0 if ref $args[0];
@@ -107,6 +108,8 @@ sub _cdc_pk_from {
 sub _cdc_fetch_pks {
     my ($self, $where) = @_;
     my @pk_cols = $self->metadm->primary_key;
+    croak sprintf('Table %s has no primary key; CDC requires one',
+        $self->metadm->name) unless @pk_cols;
     my $dbh     = $self->schema->dbh;
     my $table   = $self->metadm->db_from;
     my $sqla    = $self->schema->sql_abstract;
@@ -152,11 +155,27 @@ sub _cdc_ensure_atomic {
         $dbh->commit;
     } catch {
         my $err = $_;
-        try { $dbh->rollback };
+        eval { $dbh->rollback };
+        warn "CDC: rollback failed: $@" if $@;
         die $err;
     };
     return $wantarray ? @result : $result[0];
 }
+
+# ---------------------------------------------------------------
+# Method dispatch note:
+#
+#   Passthrough (untracked table) uses $self->next::method(@args).
+#   This walks the full C3 MRO, which is correct when a user's table
+#   class inherits from CDC::Table and may have intermediate classes.
+#
+#   Inside _cdc_ensure_atomic closures we use $self->SUPER::insert (etc.)
+#   because next::method cannot resolve from inside an anonymous sub —
+#   it relies on __SUB__ / caller context that closures do not provide.
+#   SUPER:: is resolved at compile time to our parent (Source::Table),
+#   which is correct as long as CDC::Table is the direct parent.
+#   This is a Perl limitation, not a design choice.
+# ---------------------------------------------------------------
 
 # ---------------------------------------------------------------
 # insert
@@ -201,7 +220,7 @@ sub update {
 
     my $schema_class = $self->schema->metadm->class;
     my $want_old     = $self->_cdc_capture_old;
-    if (_is_named_args(@args)) {
+    if (_cdc_is_named_args(@args)) {
         return $self->_cdc_class_update($schema_class, $tname, $want_old, @args);
     }
 
@@ -295,7 +314,7 @@ sub delete {
 
     my $schema_class = $self->schema->metadm->class;
     my $want_old     = $self->_cdc_capture_old;
-    if (_is_named_args(@args)) {
+    if (_cdc_is_named_args(@args)) {
         return $self->_cdc_class_delete($schema_class, $tname, $want_old, @args);
     }
 
@@ -410,6 +429,14 @@ the same pattern:
 =item 5. Dispatch the event to registered listeners.
 
 =back
+
+B<Why C<next::method> vs C<SUPER::>?>  The passthrough path (step 1)
+uses C<next::method> to correctly walk the C3 MRO.  The tracked path
+(step 3) runs inside an anonymous sub (the C<_cdc_ensure_atomic>
+closure), where C<next::method> cannot resolve the caller — a Perl
+limitation.  C<SUPER::> is compile-time-resolved to
+C<DBIx::DataModel::Source::Table>, which is correct for the
+single-inheritance chain this module uses.
 
 =head2 Instance vs Class-Method Detection
 

@@ -95,14 +95,17 @@ subtest 'error policy: abort' => sub {
 };
 
 subtest 'error policy: ignore' => sub {
-    plan tests => 1;
+    plan tests => 2;
     $CDC->setup('Test::Dispatch::Schema', tables => 'all', force => 1);
 
     $CDC->on('Test::Dispatch::Schema', '*', sub { die "silent" },
         { phase => 'in_transaction', on_error => 'ignore' });
 
+    my $warned = 0;
+    local $SIG{__WARN__} = sub { $warned++ if $_[0] =~ /ignored/ };
     lives_ok { $CDC->dispatch('Test::Dispatch::Schema', $mock_schema, $event) }
-        'ignore policy swallows';
+        'ignore policy does not die';
+    ok($warned, 'ignore policy still warns');
 };
 
 subtest 'abort does not prevent subsequent listeners from cleanup' => sub {

@@ -47,6 +47,9 @@ sub setup_cdc {
         capture_old => $capture_old,
         force       => 1,
     )->log_to_dbi($self->schema, 'cdc_events')
+     # in_transaction so the callback fires reliably inside
+     # _cdc_ensure_atomic's mini-transaction (post_commit would
+     # not fire until after commit, which hasn't happened yet).
      ->on($self->schema, '*' => sub {
          push @$events_ref, $_[0];
      }, { phase => 'in_transaction' });
@@ -118,6 +121,7 @@ sub run_common_suite {
     $self->test_db_state_update;
     $self->test_multiple_listeners;
     $self->test_operation_specific_listeners;
+    $self->test_event_pairs_capture_old_off;
 }
 
 # ---------------------------------------------------------------
@@ -471,6 +475,30 @@ sub test_event_pairs {
         is(scalar @$pairs, 1, 'one update pair');
         is($pairs->[0][0]{LOCATION}, 'Before', 'old value');
         is($pairs->[0][1]{LOCATION}, 'After',  'new value');
+    };
+}
+
+sub test_event_pairs_capture_old_off {
+    my ($self) = @_;
+    subtest 'Query helpers – event_pairs with capture_old=0' => sub {
+        plan tests => 3;
+        $self->clean;
+        $self->setup_cdc(capture_old => 0);
+
+        $self->schema->table('Department')->insert({
+            name => 'PairLight', location => 'Start',
+        });
+        my $dept = $self->schema->table('Department')
+            ->select(-where => { name => 'PairLight' })->[0];
+        $dept->update({ location => 'End' });
+
+        my $pairs = $CDC->event_pairs($self->schema,
+            table => 'departments');
+        is(scalar @$pairs, 1, 'one update pair');
+        is_deeply($pairs->[0][0], {}, 'old is empty hash (no capture_old)');
+        ok(defined $pairs->[0][1]{LOCATION}, 'new has data');
+
+        $self->setup_cdc(capture_old => 1);
     };
 }
 

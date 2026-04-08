@@ -3,10 +3,17 @@ package DBIx::DataModel::Plugin::CDC::Event;
 use strict;
 use warnings;
 use feature 'state';
+use Carp qw(croak);
 use Time::HiRes ();
+use namespace::clean;
 
 our $VERSION = '2.00';
 
+# Fork caveat: $_pid_hex is captured at require-time (parent PID).
+# After fork, the child inherits the parent's PID hex and counter,
+# which could produce ID collisions within the same second.
+# For forking servers, consider re-requiring the module or accepting
+# the (low) collision risk with the DB event_id as tiebreaker.
 my $_process_id = $$;
 my $_pid_hex    = sprintf '%04x', $_process_id % 65536;
 my $_counter    = 0;
@@ -14,17 +21,22 @@ my $_counter    = 0;
 sub build {
     my ($class, %args) = @_;
 
+    croak 'Event::build requires operation'  unless defined $args{operation};
+    croak 'Event::build requires table_name' unless defined $args{table_name};
+
     my $old = $args{old_data};
     my $new = $args{new_data};
 
     my $changed;
     if ($args{operation} eq 'UPDATE' && $old && $new) {
+        my %all_keys;
+        $all_keys{$_} = 1 for keys %$old, keys %$new;
         $changed = [
             sort grep {
                 my $o = $old->{$_} // '';
                 my $n = $new->{$_} // '';
                 $o ne $n;
-            } keys %$new
+            } keys %all_keys
         ];
     }
 

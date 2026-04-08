@@ -1,0 +1,43 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        perl-version: ['5.20', '5.30', '5.38']
+    name: Perl ${{ matrix.perl-version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl-version }}
+
+      - name: Install dependencies
+        run: cpanm --quiet --notest --installdeps .
+
+      - name: Run tests
+        run: prove -lv t/
+
+  lint:
+    runs-on: ubuntu-latest
+    name: Perl::Critic
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.38'
+
+      - name: Install dependencies
+        run: cpanm --quiet --notest --installdeps . && cpanm --quiet --notest Perl::Critic
+
+      - name: Run perlcritic
+        run: perlcritic --profile .perlcriticrc lib/
