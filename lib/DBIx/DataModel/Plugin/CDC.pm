@@ -2,7 +2,7 @@ package DBIx::DataModel::Plugin::CDC;
 
 use strict;
 use warnings;
-use Carp qw(croak);
+use Carp qw(croak carp);
 use Scalar::Util qw(refaddr);
 use Try::Tiny;
 use Cpanel::JSON::XS ();
@@ -30,6 +30,13 @@ my %REGISTRY;
 sub setup {
     my ($class, $schema_class, %args) = @_;
     croak 'setup() requires a schema class name' unless $schema_class;
+
+    if (my $prev = $REGISTRY{$schema_class}) {
+        if (!$args{force} && @{ $prev->{listeners} || [] }) {
+            carp "CDC: setup() called again for $schema_class"
+                . " — previous listeners discarded (pass force => 1 to suppress)";
+        }
+    }
 
     my $tables_arg = $args{tables} // 'all';
     my %tracked;
@@ -162,7 +169,7 @@ sub log_to_stderr {
         my ($event) = @_;
         warn sprintf "[%s] %s %s %s\n",
             $prefix, $event->{table_name},
-            $event->{operation}, $event->{event_id};
+            $event->{operation}, $event->{cdc_event_id};
     }, { phase => 'post_commit', on_error => 'ignore' });
 
     return $class;
@@ -372,10 +379,50 @@ Persist events as JSON.  Runs in_transaction, abort on error.
 
 Print one-line log.  Runs post_commit.
 
+=head2 dispatch($schema_class, $schema_obj, $event)
+
+Called internally by C<CDC::Table> after each DML.  Routes
+events to matching listeners by operation and phase.  Not
+normally called by user code.
+
+=head2 Query Helpers
+
+These methods require C<log_to_dbi()> to have been called.
+
+=over 4
+
+=item events_for($schema_class, table => $name, operation => $op?)
+
+Returns an arrayref of event rows (hashrefs) from the CDC table.
+C<operation> is optional.  Rows are ordered by C<event_id ASC>.
+
+=item count_events($schema_class, table => $name, operation => $op?)
+
+Returns the number of matching events.
+
+=item latest_event($schema_class, table => $name, operation => $op?)
+
+Returns the most recent matching event row, or C<undef>.
+
+=item event_pairs($schema_class, table => $name)
+
+Returns UPDATE events as C<[[\%old, \%new], ...]> with JSON-decoded
+C<old_data>/C<new_data>.
+
+=item clear_events($schema_class)
+
+Deletes all rows from the CDC table.
+
+=item clear_events_for($schema_class, table => $name)
+
+Deletes CDC rows for a specific table.
+
+=back
+
 =head2 Event Envelope
 
     {
-        event_id, occurred_at, schema_name, table_name,
+        cdc_event_id, occurred_at, schema_name, table_name,
         primary_key => ['ID'],        # PK column names
         row_id      => { ID => 42 },  # actual PK values
         operation   => 'UPDATE',

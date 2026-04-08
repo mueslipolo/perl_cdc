@@ -18,7 +18,7 @@ my $CDC = 'DBIx::DataModel::Plugin::CDC';
 
 subtest 'on() – validation' => sub {
     plan tests => 5;
-    $CDC->setup('Test::On::Schema', tables => 'all');
+    $CDC->setup('Test::On::Schema', tables => 'all', force => 1);
 
     throws_ok { $CDC->on() }
         qr/schema class/, 'missing schema croaks';
@@ -40,7 +40,7 @@ subtest 'on() – validation' => sub {
 
 subtest 'on() – accepts valid params' => sub {
     plan tests => 3;
-    $CDC->setup('Test::On::Schema', tables => 'all');
+    $CDC->setup('Test::On::Schema', tables => 'all', force => 1);
 
     lives_ok {
         $CDC->on('Test::On::Schema', 'insert', sub { 1 });
@@ -65,7 +65,7 @@ subtest 'on() before setup() – croaks' => sub {
 
 subtest 'log_to_dbi – validation' => sub {
     plan tests => 2;
-    $CDC->setup('Test::On::Schema', tables => 'all');
+    $CDC->setup('Test::On::Schema', tables => 'all', force => 1);
 
     lives_ok {
         $CDC->log_to_dbi('Test::On::Schema', 'cdc_events');
@@ -78,7 +78,7 @@ subtest 'log_to_dbi – validation' => sub {
 
 subtest 'log_to_stderr – registers listener' => sub {
     plan tests => 1;
-    $CDC->setup('Test::On::Schema', tables => 'all');
+    $CDC->setup('Test::On::Schema', tables => 'all', force => 1);
     lives_ok {
         $CDC->log_to_stderr('Test::On::Schema', 'TEST');
     } 'registers without error';
@@ -87,7 +87,7 @@ subtest 'log_to_stderr – registers listener' => sub {
 subtest 'chaining – setup -> log_to_dbi -> on' => sub {
     plan tests => 1;
     lives_ok {
-        $CDC->setup('Test::On::Schema', tables => 'all')
+        $CDC->setup('Test::On::Schema', tables => 'all', force => 1)
             ->log_to_dbi('Test::On::Schema')
             ->log_to_stderr('Test::On::Schema')
             ->on('Test::On::Schema', '*', sub { 1 });

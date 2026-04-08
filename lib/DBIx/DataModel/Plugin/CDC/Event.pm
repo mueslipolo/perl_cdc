@@ -31,7 +31,7 @@ sub build {
     my ($sec, $usec) = Time::HiRes::gettimeofday();
 
     return {
-        event_id        => _generate_id($sec, $usec),
+        cdc_event_id    => _generate_id($sec, $usec),
         occurred_at     => _format_ts($sec),
         schema_name     => $args{schema_name},
         table_name      => $args{table_name},
@@ -74,10 +74,45 @@ DBIx::DataModel::Plugin::CDC::Event - CDC event envelope builder
 
 =head1 DESCRIPTION
 
-Factory class.  C<build(%args)> returns a hashref with C<event_id>,
-C<occurred_at>, C<schema_name>, C<table_name>, C<primary_key>,
-C<row_id>, C<operation>, C<old_data>, C<new_data>, C<changed_columns>.
+Factory class that builds event envelope hashrefs.
 
-Event IDs are time-based: C<seconds-microseconds-pid-counter>.
+=head2 build(%args)
+
+    my $event = DBIx::DataModel::Plugin::CDC::Event->build(
+        schema_name => 'App::Schema',
+        table_name  => 'EMPLOYEES',
+        operation   => 'UPDATE',          # INSERT | UPDATE | DELETE
+        primary_key => ['ID'],            # optional, auto-populated by Table
+        row_id      => { ID => 42 },      # optional
+        old_data    => \%before,          # undef for INSERT or capture_old=0
+        new_data    => \%after,           # undef for DELETE
+    );
+
+Returns a hashref with the following fields:
+
+    cdc_event_id    Hex string: seconds-usec-pid-counter (unique per process)
+    occurred_at     ISO 8601 UTC timestamp (second precision, cached)
+    schema_name     From args
+    table_name      From args
+    primary_key     From args — PK column names as arrayref
+    row_id          From args — PK values as hashref
+    operation       From args
+    old_data        From args
+    new_data        From args
+    changed_columns Arrayref of column names that differ between old and new
+                    (only for UPDATE when both old_data and new_data are present)
+
+=head2 Event ID Format
+
+    SSSSSSSS-UUUU-PPPP-CCCC
+
+    S = seconds since epoch (hex, 8 digits)
+    U = microseconds >> 4 (hex, 4 digits)
+    P = process ID mod 65536 (hex, 4 digits)
+    C = per-process counter mod 65536 (hex, 4 digits)
+
+IDs are monotonically increasing within a single process.  For global
+ordering across processes, use the database-generated C<event_id> column
+from C<log_to_dbi>.
 
 =cut

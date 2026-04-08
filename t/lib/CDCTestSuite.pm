@@ -45,6 +45,7 @@ sub setup_cdc {
     $CDC->setup($self->schema,
         tables      => 'all',
         capture_old => $capture_old,
+        force       => 1,
     )->log_to_dbi($self->schema, 'cdc_events')
      ->on($self->schema, '*' => sub {
          push @$events_ref, $_[0];
@@ -310,7 +311,7 @@ sub test_atomicity_rollback {
         plan tests => 3;
         $self->clean;
 
-        $CDC->setup($self->schema, tables => 'all', capture_old => 1)
+        $CDC->setup($self->schema, tables => 'all', capture_old => 1, force => 1)
             ->log_to_dbi($self->schema, 'cdc_events')
             ->on($self->schema, 'INSERT' => sub {
                 die "forced abort";
@@ -484,7 +485,7 @@ sub test_event_envelope {
         });
 
         my $ev = $self->cb_events->[0];
-        ok(defined $ev->{event_id},    'event_id');
+        ok(defined $ev->{cdc_event_id}, 'cdc_event_id');
         ok(defined $ev->{occurred_at}, 'occurred_at');
         like($ev->{occurred_at}, qr/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/,
             'occurred_at is ISO 8601');
@@ -524,7 +525,7 @@ sub test_listener_in_transaction {
         $self->clean;
 
         my $saw_row = 0;
-        $CDC->setup($self->schema, tables => 'all', capture_old => 1)
+        $CDC->setup($self->schema, tables => 'all', capture_old => 1, force => 1)
             ->log_to_dbi($self->schema, 'cdc_events')
             ->on($self->schema, 'INSERT' => sub {
                 my ($event, $schema) = @_;
@@ -555,7 +556,7 @@ sub test_error_policy_warn {
         plan tests => 2;
         $self->clean;
 
-        $CDC->setup($self->schema, tables => 'all', capture_old => 1)
+        $CDC->setup($self->schema, tables => 'all', capture_old => 1, force => 1)
             ->log_to_dbi($self->schema, 'cdc_events')
             ->on($self->schema, 'INSERT' => sub {
                 die "should warn, not abort";
@@ -610,6 +611,7 @@ sub test_selective_tracking {
         $CDC->setup($self->schema,
             tables      => ['Department'],
             capture_old => 1,
+            force       => 1,
         )->log_to_dbi($self->schema, 'cdc_events');
 
         $self->schema->table('Department')->insert({
@@ -902,7 +904,7 @@ sub test_multiple_listeners {
         $self->clean;
 
         my @order;
-        $CDC->setup($self->schema, tables => 'all', capture_old => 1)
+        $CDC->setup($self->schema, tables => 'all', capture_old => 1, force => 1)
             ->log_to_dbi($self->schema, 'cdc_events')
             ->on($self->schema, '*' => sub { push @order, 'first' },
                 { phase => 'in_transaction' })
@@ -930,7 +932,7 @@ sub test_operation_specific_listeners {
         my @update_seen;
         my @delete_seen;
 
-        $CDC->setup($self->schema, tables => 'all', capture_old => 1)
+        $CDC->setup($self->schema, tables => 'all', capture_old => 1, force => 1)
             ->log_to_dbi($self->schema, 'cdc_events')
             ->on($self->schema, 'INSERT' => sub { push @insert_seen, 1 },
                 { phase => 'in_transaction' })

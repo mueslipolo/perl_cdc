@@ -15,7 +15,7 @@ subtest 'build – INSERT event' => sub {
         old_data    => undef,
         new_data    => { ID => 1, NAME => 'Alice' },
     );
-    ok(defined $ev->{event_id},    'event_id generated');
+    ok(defined $ev->{cdc_event_id},    'cdc_event_id generated');
     ok(defined $ev->{occurred_at}, 'occurred_at generated');
     like($ev->{occurred_at}, qr/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/,
         'occurred_at is ISO 8601');
@@ -59,7 +59,7 @@ subtest 'build – unique IDs' => sub {
             schema_name => 'X', table_name => 'T', operation => 'INSERT',
             old_data => undef, new_data => { I => $_ },
         );
-        $ids{ $ev->{event_id} }++;
+        $ids{ $ev->{cdc_event_id} }++;
     }
     is(scalar keys %ids, 1000, '1000 unique IDs generated');
 };

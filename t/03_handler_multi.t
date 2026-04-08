@@ -30,7 +30,7 @@ my $mock_schema = bless {}, 'Test::Dispatch::Schema';
 
 subtest 'dispatch – operation filtering' => sub {
     plan tests => 2;
-    $CDC->setup('Test::Dispatch::Schema', tables => 'all');
+    $CDC->setup('Test::Dispatch::Schema', tables => 'all', force => 1);
 
     my @seen;
     $CDC->on('Test::Dispatch::Schema', 'INSERT', sub { push @seen, 'ins' },
@@ -45,7 +45,7 @@ subtest 'dispatch – operation filtering' => sub {
 
 subtest 'dispatch – wildcard matches all' => sub {
     plan tests => 1;
-    $CDC->setup('Test::Dispatch::Schema', tables => 'all');
+    $CDC->setup('Test::Dispatch::Schema', tables => 'all', force => 1);
 
     my $called = 0;
     $CDC->on('Test::Dispatch::Schema', '*', sub { $called++ },
@@ -57,7 +57,7 @@ subtest 'dispatch – wildcard matches all' => sub {
 
 subtest 'dispatch – multiple listeners in order' => sub {
     plan tests => 1;
-    $CDC->setup('Test::Dispatch::Schema', tables => 'all');
+    $CDC->setup('Test::Dispatch::Schema', tables => 'all', force => 1);
 
     my @order;
     $CDC->on('Test::Dispatch::Schema', '*', sub { push @order, 'first' },
@@ -71,7 +71,7 @@ subtest 'dispatch – multiple listeners in order' => sub {
 
 subtest 'error policy: warn' => sub {
     plan tests => 2;
-    $CDC->setup('Test::Dispatch::Schema', tables => 'all');
+    $CDC->setup('Test::Dispatch::Schema', tables => 'all', force => 1);
 
     $CDC->on('Test::Dispatch::Schema', '*', sub { die "boom" },
         { phase => 'in_transaction', on_error => 'warn' });
@@ -85,7 +85,7 @@ subtest 'error policy: warn' => sub {
 
 subtest 'error policy: abort' => sub {
     plan tests => 1;
-    $CDC->setup('Test::Dispatch::Schema', tables => 'all');
+    $CDC->setup('Test::Dispatch::Schema', tables => 'all', force => 1);
 
     $CDC->on('Test::Dispatch::Schema', '*', sub { die "critical" },
         { phase => 'in_transaction', on_error => 'abort' });
@@ -96,7 +96,7 @@ subtest 'error policy: abort' => sub {
 
 subtest 'error policy: ignore' => sub {
     plan tests => 1;
-    $CDC->setup('Test::Dispatch::Schema', tables => 'all');
+    $CDC->setup('Test::Dispatch::Schema', tables => 'all', force => 1);
 
     $CDC->on('Test::Dispatch::Schema', '*', sub { die "silent" },
         { phase => 'in_transaction', on_error => 'ignore' });
@@ -107,7 +107,7 @@ subtest 'error policy: ignore' => sub {
 
 subtest 'abort does not prevent subsequent listeners from cleanup' => sub {
     plan tests => 2;
-    $CDC->setup('Test::Dispatch::Schema', tables => 'all');
+    $CDC->setup('Test::Dispatch::Schema', tables => 'all', force => 1);
 
     my $first_ran = 0;
     $CDC->on('Test::Dispatch::Schema', '*', sub { $first_ran = 1 },

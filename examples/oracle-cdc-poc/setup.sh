@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # CDC PoC — Fully containerized setup & execution
-# Prerequisites: podman + podman-compose (nothing else)
+# Supports both podman and docker (prefers podman).
 # Copyright: Yves. Apache 2.0
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,22 +15,46 @@ info() { printf "${BLUE}[INFO]${NC}  %s\n" "$*"; }
 ok()   { printf "${GREEN}[OK]${NC}    %s\n" "$*"; }
 die()  { printf "${RED}[ERR]${NC}   %s\n" "$*" >&2; exit 1; }
 
+# ─── Detect container runtime ──────────────────────────────────
+if command -v podman >/dev/null 2>&1; then
+    RUNTIME=podman
+elif command -v docker >/dev/null 2>&1; then
+    RUNTIME=docker
+else
+    die "Neither podman nor docker found in PATH"
+fi
+
+if command -v "${RUNTIME}-compose" >/dev/null 2>&1; then
+    COMPOSE="${RUNTIME}-compose"
+elif [[ "${RUNTIME}" == "docker" ]] && docker compose version >/dev/null 2>&1; then
+    COMPOSE="docker compose"
+else
+    die "${RUNTIME}-compose not found (and docker compose plugin not available)"
+fi
+
+readonly RUNTIME COMPOSE
+readonly CONTAINER_PREFIX="cdc"
+readonly ORACLE_CONTAINER="${CONTAINER_PREFIX}-oracle"
+readonly NETWORK="${CONTAINER_PREFIX}-poc_default"
+
+info "Using ${RUNTIME} + ${COMPOSE}"
+
 # ─── Build app image (from repo root for full build context) ────
 info "Building Perl app image..."
-podman build -f docker/Dockerfile.app -t cdc-poc-app "${REPO_ROOT}"
+${RUNTIME} build -f docker/Dockerfile.app -t cdc-poc-app "${REPO_ROOT}"
 ok "App image built"
 
 # ─── Start Oracle ───────────────────────────────────────────────────────
-if podman ps --format '{{.Names}}' | grep -q '^cdc-oracle$'; then
+if ${RUNTIME} ps --format '{{.Names}}' | grep -q "^${ORACLE_CONTAINER}$"; then
     ok "Oracle container already running"
 else
     info "Starting Oracle (first run pulls ~1.5 GB image, init takes ~2 min)..."
-    podman-compose up -d oracle
+    ${COMPOSE} up -d oracle
 fi
 
 info "Waiting for Oracle to be healthy (timeout: ${MAX_WAIT}s)..."
 elapsed=0
-until podman inspect --format='{{.State.Health.Status}}' cdc-oracle 2>/dev/null | grep -q healthy; do
+until ${RUNTIME} inspect --format='{{.State.Health.Status}}' "${ORACLE_CONTAINER}" 2>/dev/null | grep -q healthy; do
     (( elapsed >= MAX_WAIT )) && die "Oracle not healthy after ${MAX_WAIT}s"
     printf "."
     sleep 5
@@ -42,7 +66,7 @@ ok "Oracle is ready (${elapsed}s)"
 # ─── Verify listener ───────────────────────────────────────────────────
 info "Verifying Oracle listener accepts connections..."
 elapsed=0
-until podman run --rm --network cdc-poc_default \
+until ${RUNTIME} run --rm --network "${NETWORK}" \
     -e ORACLE_DSN="dbi:Oracle:host=oracle;port=1521;service_name=FREEPDB1" \
     -e ORACLE_USER=appuser \
     -e ORACLE_PASS=apppass \
@@ -59,8 +83,8 @@ ok "Oracle listener ready"
 
 # ─── Run tests ──────────────────────────────────────────────────────────
 info "Running end-to-end tests..."
-podman run --rm \
-    --network cdc-poc_default \
+${RUNTIME} run --rm \
+    --network "${NETWORK}" \
     -e ORACLE_DSN="dbi:Oracle:host=oracle;port=1521;service_name=FREEPDB1" \
     -e ORACLE_USER=appuser \
     -e ORACLE_PASS=apppass \
@@ -68,14 +92,14 @@ podman run --rm \
 
 ok "Done — all tests passed"
 
-cat <<'EOF'
+cat <<EOF
 
   Useful commands:
-    podman run --rm --network cdc-poc_default \
-      -e ORACLE_DSN="dbi:Oracle:host=oracle;port=1521;service_name=FREEPDB1" \
+    ${RUNTIME} run --rm --network ${NETWORK} \\
+      -e ORACLE_DSN="dbi:Oracle:host=oracle;port=1521;service_name=FREEPDB1" \\
       -e ORACLE_USER=appuser -e ORACLE_PASS=apppass cdc-poc-app
                                        — re-run tests
-    podman logs cdc-oracle             — Oracle logs
-    podman-compose down -v             — tear down everything
+    ${RUNTIME} logs ${ORACLE_CONTAINER} — Oracle logs
+    ${COMPOSE} down -v                 — tear down everything
 
 EOF

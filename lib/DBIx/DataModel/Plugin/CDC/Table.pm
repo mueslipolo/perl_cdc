@@ -11,6 +11,17 @@ use namespace::clean;
 
 our $VERSION = '2.00';
 
+# ---------------------------------------------------------------
+# CDC naming convention: all column names and table names in event
+# data are UPPER-CASED.  Normalization points:
+#   - _cdc_snapshot()    : column keys  -> uc()
+#   - _cdc_table_name()  : table name   -> uc(db_from)
+#   - _cdc_pk_from()     : PK keys      -> uc()
+#   - _cdc_event()       : primary_key  -> uc()
+# This matches Oracle's default behavior (NAME_uc) and is applied
+# uniformly regardless of the backend's FetchHashKeyName setting.
+# ---------------------------------------------------------------
+
 # Helper: detect class-method style calls like ->update(-set => ..., -where => ...)
 sub _is_named_args {
     my (@args) = @_;
@@ -39,7 +50,7 @@ sub _cdc_table_name {
 # (__schema, __schema_class) and Composition component keys.
 # ---------------------------------------------------------------
 sub _cdc_snapshot {
-    my ($class_or_self, $obj) = @_;
+    my ($obj) = @_;
 
     # Build skip-set: internal keys + composition component role names
     my %skip;
@@ -170,7 +181,7 @@ sub insert {
                 operation   => 'INSERT',
                 row_id      => $self->_cdc_pk_from($rec),
                 old_data    => undef,
-                new_data    => _cdc_snapshot(undef, $rec),
+                new_data    => _cdc_snapshot($rec),
             ));
         }
 
@@ -195,7 +206,7 @@ sub update {
     }
 
     # Instance method: $row->update({...})
-    my $old = $want_old ? _cdc_snapshot(undef, $self) : undef;
+    my $old = $want_old ? _cdc_snapshot($self) : undef;
 
     return $self->_cdc_ensure_atomic(sub {
         my $result = $self->SUPER::update(@args);
@@ -203,7 +214,7 @@ sub update {
         my $to_set  = ref $args[0] eq 'HASH' ? $args[0] : {};
         my %changes = map { uc($_) => $to_set->{$_} } keys %$to_set;
         my $new = $old ? { %$old, %changes }
-                       : { %{_cdc_snapshot(undef, $self)}, %changes };
+                       : { %{_cdc_snapshot($self)}, %changes };
 
         $self->_cdc_dispatch($self->_cdc_event(
             schema_name => $schema_class,
@@ -230,7 +241,7 @@ sub _cdc_class_update {
         my @pk_cols = map { uc($_) } $self->metadm->primary_key;
         return $self->_cdc_ensure_atomic(sub {
             my $rows = $self->select(-where => $where);
-            my @snapshots = map { _cdc_snapshot(undef, $_) } @$rows;
+            my @snapshots = map { _cdc_snapshot($_) } @$rows;
 
             my $result = $self->SUPER::update(@args);
 
@@ -289,7 +300,7 @@ sub delete {
     }
 
     # Instance method: $row->delete()
-    my $old = $want_old ? _cdc_snapshot(undef, $self) : undef;
+    my $old = $want_old ? _cdc_snapshot($self) : undef;
 
     return $self->_cdc_ensure_atomic(sub {
         my $result = $self->SUPER::delete(@args);
@@ -316,7 +327,7 @@ sub _cdc_class_delete {
         my @pk_cols = map { uc($_) } $self->metadm->primary_key;
         return $self->_cdc_ensure_atomic(sub {
             my $rows = $self->select(-where => $where);
-            my @snapshots = map { _cdc_snapshot(undef, $_) } @$rows;
+            my @snapshots = map { _cdc_snapshot($_) } @$rows;
 
             my $result = $self->SUPER::delete(@args);
 
@@ -366,10 +377,67 @@ __END__
 
 DBIx::DataModel::Plugin::CDC::Table - CDC-aware table parent class
 
+=head1 SYNOPSIS
+
+    DBIx::DataModel->Schema('App::Schema',
+        table_parent => 'DBIx::DataModel::Plugin::CDC::Table',
+    );
+
 =head1 DESCRIPTION
 
 Use as C<table_parent> when declaring a DBIx::DataModel schema.
 Overrides C<insert>, C<update>, and C<delete> to capture change
 events and dispatch them to registered listeners.
+
+If a table is not tracked (see C<CDC-E<gt>setup()>), the overridden
+methods pass through to the parent with zero overhead.
+
+=head2 How DML Interception Works
+
+Each overridden method (C<insert>, C<update>, C<delete>) follows
+the same pattern:
+
+=over 4
+
+=item 1. Check if the table is tracked.  If not, call C<next::method>.
+
+=item 2. Wrap the operation in C<_cdc_ensure_atomic> (mini-transaction).
+
+=item 3. Call C<SUPER::insert/update/delete> to execute the real DML.
+
+=item 4. Build an event envelope via C<CDC::Event-E<gt>build()>.
+
+=item 5. Dispatch the event to registered listeners.
+
+=back
+
+=head2 Instance vs Class-Method Detection
+
+C<update> and C<delete> support two calling conventions in
+DBIx::DataModel:
+
+    $row->update({ col => $val });                # instance method
+    Table->update(-set => {...}, -where => {...}); # class method
+
+The plugin detects class-method calls by checking whether the first
+argument starts with C<-> (e.g., C<-set>, C<-where>).  For class-method
+operations, it pre-fetches affected primary keys (or full rows when
+C<capture_old =E<gt> 1>) and emits one CDC event per affected row.
+
+=head2 Transaction Safety
+
+C<_cdc_ensure_atomic> wraps the DML + CDC event in a mini-transaction
+when C<AutoCommit> is on.  When already inside a transaction (either
+C<AutoCommit> off or C<do_transaction>), it lets the enclosing
+transaction govern.  This guarantees the DML and CDC event are always
+atomic.
+
+=head2 Naming Convention
+
+All column names and table names in CDC event data are B<upper-cased>,
+regardless of the database or C<FetchHashKeyName> setting.  The
+normalization points are C<_cdc_snapshot> (column keys), C<_cdc_table_name>
+(table name), C<_cdc_pk_from> (PK keys), and C<_cdc_event> (primary_key
+list).
 
 =cut

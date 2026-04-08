@@ -31,7 +31,7 @@ subtest 'setup – basic configuration' => sub {
 subtest 'setup – selective tables' => sub {
     plan tests => 3;
 
-    $CDC->setup('Test::CDC::Schema', tables => ['Foo']);
+    $CDC->setup('Test::CDC::Schema', tables => ['Foo'], force => 1);
 
     ok($CDC->is_tracked('Test::CDC::Schema', 'Foo'),  'Foo tracked');
     ok(!$CDC->is_tracked('Test::CDC::Schema', 'Bar'), 'Bar NOT tracked');
@@ -50,6 +50,20 @@ subtest 'is_tracked – unconfigured schema' => sub {
     plan tests => 1;
     ok(!$CDC->is_tracked('No::Such::Schema', 'Foo'),
         'unconfigured schema returns false');
+};
+
+subtest 'setup() twice – warns about discarded listeners' => sub {
+    plan tests => 2;
+    $CDC->setup('Test::CDC::Schema', tables => 'all');
+    $CDC->on('Test::CDC::Schema', '*' => sub { 1 });
+
+    my $warned = 0;
+    local $SIG{__WARN__} = sub { $warned++ if $_[0] =~ /listeners discarded/ };
+    $CDC->setup('Test::CDC::Schema', tables => 'all');
+    ok($warned, 'warning emitted when listeners would be lost');
+
+    # Config still works after re-setup
+    ok($CDC->is_tracked('Test::CDC::Schema', 'Foo'), 'tracking still works');
 };
 
 done_testing();

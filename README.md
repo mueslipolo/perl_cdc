@@ -24,6 +24,33 @@ From source:
 perl Makefile.PL && make && make test && make install
 ```
 
+## Development
+
+Clone and install dependencies locally (no root needed):
+
+```bash
+git clone https://github.com/mueslipolo/perl_cdc.git
+cd perl_cdc
+./dev.sh setup    # installs CPAN deps into ./local/
+./dev.sh test     # runs all tests (unit + SQLite e2e)
+```
+
+Or manually:
+
+```bash
+cpanm --local-lib=./local --installdeps .
+PERL5LIB=./local/lib/perl5:./lib prove -lv t/
+```
+
+For the Oracle integration tests (requires Docker/Podman):
+
+```bash
+cd examples/oracle-cdc-poc
+./setup.sh
+```
+
+---
+
 ## Quick Start
 
 ```perl
@@ -270,7 +297,7 @@ Every listener receives an event hashref with this structure:
 
 ```perl
 {
-    event_id        => '680e3a1f-0a2b-1a3c-0001',
+    cdc_event_id    => '680e3a1f-0a2b-1a3c-0001',
     occurred_at     => '2026-04-03T14:32:01Z',       # ISO 8601 UTC
     schema_name     => 'App::Schema',
     table_name      => 'EMPLOYEES',                   # always upper-case
@@ -286,7 +313,7 @@ Every listener receives an event hashref with this structure:
 
 | Field | Always? | Description |
 |---|---|---|
-| `event_id` | Yes | Time-based, monotonic within process |
+| `cdc_event_id` | Yes | Time-based, monotonic within process |
 | `primary_key` | Yes | PK column names: `['ID']` or `['A', 'B']` |
 | `row_id` | Yes | PK values: `{ ID => 42 }` — identifies which row |
 | `operation` | Yes | `INSERT`, `UPDATE`, or `DELETE` |
@@ -339,9 +366,57 @@ to `'cdc_events'`.  Runs `in_transaction` with `abort` on error.
 Table name is validated against SQL injection (`/\A[a-zA-Z_]\w*\z/`).
 Uses a prepared statement cache for performance.
 
+The plugin INSERTs exactly four columns: `table_name`, `operation`,
+`old_data`, `new_data`.  You must create the target table yourself.
+Add any extra columns (timestamps, auto-increment PK) as DB defaults.
+
+**SQLite:**
+
+```sql
+CREATE TABLE cdc_events (
+    event_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    table_name TEXT    NOT NULL,
+    operation  TEXT    NOT NULL,
+    old_data   TEXT,
+    new_data   TEXT
+);
+```
+
+**PostgreSQL:**
+
+```sql
+CREATE TABLE cdc_events (
+    event_id   SERIAL       PRIMARY KEY,
+    event_time TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    table_name VARCHAR(128) NOT NULL,
+    operation  VARCHAR(6)   NOT NULL CHECK (operation IN ('INSERT','UPDATE','DELETE')),
+    old_data   JSONB,
+    new_data   JSONB
+);
+CREATE INDEX cdc_events_table_op_idx ON cdc_events (table_name, operation);
+```
+
+**Oracle:**
+
+```sql
+CREATE TABLE cdc_events (
+    event_id   NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    event_time TIMESTAMP    DEFAULT SYSTIMESTAMP NOT NULL,
+    table_name VARCHAR2(128) NOT NULL,
+    operation  VARCHAR2(6)   NOT NULL CHECK (operation IN ('INSERT','UPDATE','DELETE')),
+    old_data   CLOB,
+    new_data   CLOB
+);
+CREATE INDEX cdc_events_table_op_idx ON cdc_events (table_name, operation, event_id);
+```
+
+> **Note:** The DB `event_id` column is the database auto-increment.  The Perl
+> event envelope uses `cdc_event_id` (a hex timestamp string).  These are
+> different fields — the plugin does not write `cdc_event_id` to the database.
+
 ### `->log_to_stderr($schema, $prefix?)`
 
-Built-in listener: print `[CDC] TABLE OPERATION event_id` to STDERR.
+Built-in listener: print `[CDC] TABLE OPERATION cdc_event_id` to STDERR.
 Defaults prefix to `'CDC'`.  Runs `post_commit` with `ignore` on error.
 
 ### Writing a Custom Listener
