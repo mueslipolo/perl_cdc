@@ -660,9 +660,75 @@ declaration) are automatically excluded from snapshots via
 
 ---
 
+## Transactional Outbox Pattern
+
+This plugin implements the **write side** of the
+[transactional outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html).
+
+The outbox pattern solves the dual-write problem: when a service needs
+to update a database AND publish an event, doing both independently
+risks one succeeding and the other failing.  The solution is to write
+the event to an "outbox" table in the **same database transaction** as
+the business data change, then relay it asynchronously.
+
+```
+┌─────────────────────────────────────────────┐
+│  DB Transaction                             │
+│                                             │
+│  INSERT INTO departments (name) VALUES (?)  │
+│  INSERT INTO cdc_events  (...)  VALUES (?)  │  ← log_to_dbi
+│                                             │
+│  COMMIT                                     │
+└─────────────────────────────────────────────┘
+         │
+         │  (relay — not provided by this plugin)
+         ▼
+  ┌──────────────┐
+  │ Message broker│  Kafka, Redis Streams, RabbitMQ, ...
+  └──────────────┘
+```
+
+**What the plugin provides:**
+
+- `log_to_dbi` writes CDC events to the `cdc_events` table atomically
+  with the DML.  Both commit or both roll back.  There is no window
+  where a row is committed without its corresponding event.
+- The `cdc_events` table IS the outbox.  No separate table needed.
+
+**What you need to build:**
+
+A **relay** process that reads the outbox and publishes to your broker.
+A simple approach using a `post_commit` listener:
+
+```perl
+$CDC->on('App::Schema', '*' => sub {
+    my ($event) = @_;
+    $redis->xadd('cdc:events', '*',
+        table     => $event->{table_name},
+        operation => $event->{operation},
+        payload   => encode_json($event),
+    );
+}, { phase => 'post_commit' });
+```
+
+Or an external poller for full reliability (at-least-once delivery):
+
+```perl
+# cron / daemon
+my $events = $dbh->selectall_arrayref(
+    'SELECT * FROM cdc_events WHERE relayed = 0 ORDER BY event_id',
+    { Slice => {} });
+for my $ev (@$events) {
+    publish_to_broker($ev);
+    $dbh->do('UPDATE cdc_events SET relayed = 1 WHERE event_id = ?',
+        undef, $ev->{event_id});
+}
+```
+
+---
+
 ## Future Extensions
 
-- **Transactional outbox** — buffer events, relay to Kafka/RabbitMQ asynchronously
 - **Per-table listener config** — different listeners for different tables
 - **Column filtering** — skip specific columns from CDC capture
 - **Operation-specific `log_to_dbi`** — only persist certain operations
