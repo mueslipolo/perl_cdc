@@ -654,7 +654,7 @@ declaration) are automatically excluded from snapshots via
 | INSERT captures args, not DB row | DB-generated defaults (`created_at`, sequences) are absent from INSERT `new_data` |
 | Pre-fetch on class-method ops | PK-only SELECT with `capture_old=0`; full SELECT with `capture_old=1` |
 | Single-process IDs | Event IDs are unique per process; use the DB-generated `event_id` column for global ordering |
-| JSON in CLOB | Wide tables produce large JSON payloads in Oracle CLOB columns |
+| JSON payload size | Wide tables produce large JSON payloads in `old_data`/`new_data` columns |
 | `changed_columns` on refs | Inflated values compared by refaddr, not deep equality — may report false positives |
 | Perl-side snapshots | CDC captures ORM-inflated values, not raw DB column values |
 
