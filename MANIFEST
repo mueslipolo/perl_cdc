@@ -21,3 +21,6 @@ t/01_event.t
 t/02_handler_base.t
 t/03_handler_multi.t
 t/04_setup.t
+t/10_e2e_sqlite.t
+t/lib/CDCTestSuite.pm
+t/lib/CDCTestSuite/Schema.pm

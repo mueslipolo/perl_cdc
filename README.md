@@ -418,19 +418,24 @@ DBIx-DataModel-Plugin-CDC/
 │       └── CDC/
 │           ├── Table.pm              # table_parent (insert/update/delete)
 │           └── Event.pm              # Event envelope builder
-├── t/                                # Unit tests (no database required)
-│   ├── 00_compile.t                  # All modules load
-│   ├── 01_event.t                    # Event envelope, IDs, validation
-│   ├── 02_handler_base.t            # on(), log_to_dbi, log_to_stderr validation
-│   ├── 03_handler_multi.t           # Dispatch, operation filtering, error policies
-│   └── 04_setup.t                    # Registry, selective tables
+├── t/
+│   ├── lib/
+│   │   ├── CDCTestSuite.pm          # Shared e2e test logic (30 subtests)
+│   │   └── CDCTestSuite/
+│   │       └── Schema.pm            # Shared schema (all backends)
+│   ├── 00_compile.t                  # Unit: all modules load
+│   ├── 01_event.t                    # Unit: event envelope, IDs
+│   ├── 02_handler_base.t            # Unit: on(), log_to_dbi validation
+│   ├── 03_handler_multi.t           # Unit: dispatch, error policies
+│   ├── 04_setup.t                    # Unit: registry, selective tables
+│   └── 10_e2e_sqlite.t              # E2E: SQLite backend + shared suite
 ├── examples/
-│   └── oracle-cdc-poc/               # Integration example (Oracle)
+│   └── oracle-cdc-poc/               # Oracle integration example
 │       ├── setup.sh                  # One-command build + test
 │       ├── docker-compose.yml
 │       ├── docker/
 │       ├── lib/App/
-│       └── t/01_cdc_end_to_end.t     # 51 integration tests + benchmarks
+│       └── t/01_cdc_end_to_end.t     # E2E: Oracle backend + shared suite
 ├── Makefile.PL
 ├── cpanfile
 ├── Changes
@@ -439,11 +444,47 @@ DBIx-DataModel-Plugin-CDC/
 └── README.md
 ```
 
-## Test Coverage
+## Test Architecture
 
-**75 total tests**: 24 unit + 51 integration.
+Tests are organized in three layers:
 
-### Unit Tests (t/ — no database, runs on CPAN smoke)
+```
+Layer 1: Unit tests (t/00-04)        No DB.  Pure Perl logic.
+Layer 2: E2E shared suite            Real DB round-trips via CDCTestSuite.pm.
+Layer 3: Backend-specific tests       SQLite or Oracle edge cases.
+```
+
+### Shared Test Suite (`t/lib/CDCTestSuite.pm`)
+
+The e2e tests use a **shared OO test suite** so the same 30 subtests run
+against every supported backend.  Each backend `.t` file provides the
+`$dbh` and DDL, then calls:
+
+```perl
+use CDCTestSuite::Schema;   # shared schema: Department, Employee, Composition
+use CDCTestSuite;
+
+CDCTestSuite::Schema->dbh($dbh);
+my $suite = CDCTestSuite->new(dbh => $dbh);
+$suite->setup_cdc(capture_old => 1);
+$suite->run_common_suite;    # runs all 30 shared subtests
+
+# Then backend-specific tests inline...
+```
+
+`CDCTestSuite::Schema` declares the Department and Employee tables with
+a Composition relationship.  It contains no database-specific logic.
+Both the SQLite and Oracle backends use this same schema.
+
+**Adding a new backend** (e.g., PostgreSQL) requires only a new ~60-line
+test file: connect, DDL, `$suite->run_common_suite`, PG-specific tests.
+Zero changes to the shared suite.
+
+### Test Coverage
+
+**56 total tests**: 24 unit + 32 e2e (SQLite).  Oracle adds ~20 more.
+
+#### Unit Tests (t/00-04 — no database, runs on CPAN smoke)
 
 | File | Tests | Covers |
 |---|---|---|
@@ -453,20 +494,39 @@ DBIx-DataModel-Plugin-CDC/
 | `03_handler_multi.t` | 10 | Operation filtering, wildcard, listener ordering, abort/warn/ignore |
 | `04_setup.t` | 7 | Registry, selective tables, `is_tracked`, validation |
 
-### Integration Tests (examples/oracle-cdc-poc/t/ — needs Oracle)
+#### E2E Shared Suite (30 subtests — runs on every backend)
 
-| Section | Tests | Covers |
+| Category | Subtests | Covers |
 |---|---|---|
-| CRUD | 5 | INSERT, UPDATE, DELETE with event content |
-| Transactions | 8 | ROLLBACK, COMMIT, atomicity, lifecycle, interleaved, constraints |
-| Class-method ops | 3 | Bulk UPDATE/DELETE per-row, no-match |
-| Data integrity | 8 | NULL, unchanged columns, bulk, FK, UTF-8, empty string, history, JSON |
-| Metadata & helpers | 5 | event_id, ordering, event_pairs, count, selective clear |
-| Plugin features | 10 | Envelope (row_id, primary_key, changed_columns), listeners, abort/warn, log_to_stderr |
-| capture_old modes | 1 | capture_old=0: no old_data, row_id present, class-method no pre-fetch |
-| Performance | 5 | INSERT/UPDATE/DELETE ORM vs CDC, batch, capture_old=1 vs 0 |
-| Relationships | 5 | FK parent/child, cross-table rollback, snapshot filters, rapid ops |
-| Trade-offs | 1 | Raw DBI bypass |
+| CRUD | 7 | INSERT, UPDATE, DELETE (instance + class method) |
+| Transactions | 1 | Atomicity: abort rolls back DML and CDC event |
+| capture_old modes | 2 | Lightweight mode (instance + class method) |
+| Query helpers | 3 | events_for, count/latest/clear_events, event_pairs |
+| Event envelope | 2 | All fields present, changed_columns on UPDATE |
+| Listener phases | 1 | in_transaction listener has DB access |
+| Error policies | 1 | warn does not abort DML |
+| Composition | 3 | Subtree insert, cascaded delete, insert_into_* |
+| Edge cases | 5 | NULL, zero-match update/delete, double update history |
+| DB verification | 2 | INSERT/UPDATE data matches actual DB state |
+| Listeners | 2 | Multiple listener ordering, operation-specific filtering |
+| Selective tracking | 1 | Untracked table passthrough |
+
+#### SQLite-Specific (t/10_e2e_sqlite.t)
+
+| Test | Covers |
+|---|---|
+| UTF-8 round-trip | Accented characters survive JSON encode/decode via SQLite |
+| Empty string is NOT NULL | SQLite preserves `''` (unlike Oracle which maps it to NULL) |
+
+#### Oracle-Specific (examples/oracle-cdc-poc/t/)
+
+| Section | Covers |
+|---|---|
+| Infrastructure | Oracle connectivity, table existence |
+| Transactions | ROLLBACK, COMMIT, constraint violations, cross-table rollback |
+| Edge cases | Empty string = NULL (Oracle semantics), special characters, snapshot filters |
+| Performance | INSERT/UPDATE/DELETE benchmarks: ORM vs ORM+CDC (set `CDC_PERF_N`) |
+| Trade-offs | Raw DBI bypass not captured (by design) |
 
 ---
 
